@@ -1,0 +1,8 @@
+PyQt5>=5.15,<5.16
+PyQtWebEngine>=5.15,<5.16
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.7
+pydicom>=2.4
+glymur>=0.13
+pyinstaller>=6.10
