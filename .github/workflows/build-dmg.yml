@@ -1,0 +1,89 @@
+name: Build macOS DMG
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "slice_report_desktop.py"
+      - "build_iodine_kedge_report.py"
+      - "requirements-desktop-build.txt"
+      - ".github/workflows/build-dmg.yml"
+      - "reconstructed_weight_maps/logo/**"
+
+jobs:
+  build-macos:
+    runs-on: macos-13
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install OpenJPEG
+        run: |
+          brew update
+          brew install openjpeg
+
+      - name: Install Python Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-desktop-build.txt
+
+      - name: Build macOS App
+        shell: bash
+        run: |
+          set -euxo pipefail
+          OPENJPEG_DYLIB="$(find "$(brew --prefix openjpeg)/lib" -name 'libopenjp2*.dylib' | head -n 1)"
+          if [ -z "${OPENJPEG_DYLIB}" ]; then
+            echo "OpenJPEG dynamic library not found"
+            exit 1
+          fi
+          python -m PyInstaller \
+            slice_report_desktop.py \
+            --noconfirm \
+            --clean \
+            --windowed \
+            --name KEdgeSliceReport \
+            --distpath dist \
+            --workpath build \
+            --specpath build \
+            --hidden-import PyQt5.QtWebEngineWidgets \
+            --hidden-import PyQt5.QtWebEngineCore \
+            --hidden-import PyQt5.QtWebChannel \
+            --collect-submodules glymur \
+            --collect-submodules matplotlib \
+            --collect-data matplotlib \
+            --add-data "reconstructed_weight_maps/logo:reconstructed_weight_maps/logo" \
+            --add-binary "${OPENJPEG_DYLIB}:."
+
+      - name: Build DMG
+        shell: bash
+        run: |
+          set -euxo pipefail
+          mkdir -p release/dmg-root
+          cp -R "dist/KEdgeSliceReport.app" "release/dmg-root/"
+          hdiutil create \
+            -volname "KEdgeSliceReport" \
+            -srcfolder "release/dmg-root" \
+            -ov \
+            -format UDZO \
+            "release/KEdgeSliceReport-macos.dmg"
+
+      - name: Upload macOS App
+        uses: actions/upload-artifact@v4
+        with:
+          name: KEdgeSliceReport-macos-app
+          path: dist/KEdgeSliceReport.app
+
+      - name: Upload DMG
+        uses: actions/upload-artifact@v4
+        with:
+          name: KEdgeSliceReport-macos-dmg
+          path: release/KEdgeSliceReport-macos.dmg
