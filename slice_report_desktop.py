@@ -33,7 +33,13 @@ except Exception:
 from build_iodine_kedge_report import ROOT, generate_single_slice_report, ordered_dicom_files
 
 
-ICON_DIR = ROOT / "reconstructed_weight_maps" / "logo"
+def bundle_root() -> Path:
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)
+    return ROOT
+
+
+ICON_DIR = bundle_root() / "reconstructed_weight_maps" / "logo"
 OUTPUT_ROOT = ROOT / "ui_slice_reports"
 QTWEBENGINE_CACHE_DIR = ROOT / ".qtwebengine_cache"
 QTWEBENGINE_STORAGE_DIR = ROOT / ".qtwebengine_storage"
