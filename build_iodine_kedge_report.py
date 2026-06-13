@@ -161,14 +161,26 @@ def downsample_for_preview(x, max_size=1024):
     return arr[::step, ::step]
 
 
+def get_colormap(name, samples=None):
+    registry = getattr(matplotlib, "colormaps", None)
+    if registry is not None:
+        cmap = registry.get_cmap(name)
+        if samples is not None and hasattr(cmap, "resampled"):
+            return cmap.resampled(samples)
+        return cmap
+    if samples is not None:
+        return matplotlib.cm.get_cmap(name, samples)
+    return matplotlib.cm.get_cmap(name)
+
+
 def build_colormap_lut(name):
-    cmap = matplotlib.cm.get_cmap(name, 256)
+    cmap = get_colormap(name, 256)
     lut = (cmap(np.linspace(0.0, 1.0, 256))[:, :3] * 255.0).round().astype(np.uint8)
     return lut.tolist()
 
 
 def build_colormap_css_gradient(name, steps=16):
-    cmap = matplotlib.cm.get_cmap(name, steps)
+    cmap = get_colormap(name, steps)
     stops = []
     for idx, rgba in enumerate(cmap(np.linspace(0.0, 1.0, steps))):
         pct = 100.0 * idx / max(steps - 1, 1)
