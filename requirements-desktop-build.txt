@@ -6,3 +6,4 @@ matplotlib>=3.7
 pydicom>=2.4
 glymur>=0.13
 pyinstaller>=6.10
+Pillow>=10
