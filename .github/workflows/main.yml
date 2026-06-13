@@ -1,0 +1,58 @@
+name: Build Windows EXE
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - master
+    paths:
+      - "slice_report_desktop.py"
+      - "build_iodine_kedge_report.py"
+      - "requirements-desktop-build.txt"
+      - "scripts/build_windows_exe.py"
+      - ".github/workflows/build-exe.yml"
+      - "reconstructed_weight_maps/logo/**"
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Miniconda
+        uses: conda-incubator/setup-miniconda@v3
+        with:
+          activate-environment: exe-build
+          auto-activate-base: false
+          python-version: "3.11"
+
+      - name: Install OpenJPEG
+        shell: bash -el {0}
+        run: |
+          conda install -y -c conda-forge openjpeg
+
+      - name: Install Python Dependencies
+        shell: bash -el {0}
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-desktop-build.txt
+
+      - name: Build EXE
+        shell: bash -el {0}
+        run: |
+          python scripts/build_windows_exe.py
+
+      - name: Upload EXE Directory
+        uses: actions/upload-artifact@v4
+        with:
+          name: KEdgeSliceReport-windows-dir
+          path: dist/KEdgeSliceReport
+
+      - name: Upload EXE Zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: KEdgeSliceReport-windows-zip
+          path: release/KEdgeSliceReport-windows.zip
