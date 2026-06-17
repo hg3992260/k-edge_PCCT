@@ -477,7 +477,7 @@ class SliceReportMainWindow(QMainWindow):
             return
 
         if not files:
-            QMessageBox.warning(self, "未发现切片", "当前目录中未发现包含 PixelData 和 EFE1 的 DICOM 文件。")
+            QMessageBox.warning(self, "未发现切片", "当前路径及子目录中未发现包含 PixelData 和 EFE1 的 DICOM 文件。")
             return
 
         self.case_dir = case_dir
@@ -500,7 +500,7 @@ class SliceReportMainWindow(QMainWindow):
         self.btn_open_report.setEnabled(False)
         self.btn_open_output.setEnabled(False)
         self.preview_widget.show_placeholder("已识别切片，请选择序数后点击分析，右侧将显示内嵌 HTML 预览。")
-        self.append_log("已完成目录识别")
+        self.append_log("已完成路径识别")
         self.append_log(f"识别到 {len(files)} 张可分析切片")
 
     def current_slice_path(self) -> Optional[Path]:

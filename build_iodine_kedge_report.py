@@ -33,8 +33,20 @@ def default_app_root():
     return Path(__file__).resolve().parent
 
 
+def default_data_dir(root: Path) -> Path:
+    preferred = [
+        root / "dcm",
+        root / "P10",
+        root / "00020006",
+    ]
+    for candidate in preferred:
+        if candidate.exists():
+            return candidate
+    return root / "00020006"
+
+
 ROOT = Path(os.environ.get("KEDGE_APP_ROOT", str(default_app_root())))
-DATA_DIR = Path(os.environ.get("KEDGE_DATA_DIR", str(ROOT / "00020006")))
+DATA_DIR = Path(os.environ.get("KEDGE_DATA_DIR", str(default_data_dir(ROOT))))
 OUT_DIR = Path(os.environ.get("KEDGE_OUT_DIR", str(ROOT / "reconstructed_weight_maps")))
 CACHE_DIR = Path(os.environ.get("KEDGE_CACHE_DIR", str(ROOT / "_pcct_cache")))
 
@@ -161,26 +173,66 @@ def downsample_for_preview(x, max_size=1024):
     return arr[::step, ::step]
 
 
-def get_colormap(name, samples=None):
+IODINE_CMAP_NAME = "magma"
+KEDGE_CMAP_NAME = "viridis"
+IODINE_CMAP_RANGE = (0.06, 0.88)
+KEDGE_CMAP_RANGE = (0.08, 0.86)
+
+
+def get_colormap(name, samples=None, value_range=None):
     registry = getattr(matplotlib, "colormaps", None)
     if registry is not None:
         cmap = registry.get_cmap(name)
-        if samples is not None and hasattr(cmap, "resampled"):
-            return cmap.resampled(samples)
-        return cmap
-    if samples is not None:
-        return matplotlib.cm.get_cmap(name, samples)
-    return matplotlib.cm.get_cmap(name)
+    elif samples is not None:
+        cmap = matplotlib.cm.get_cmap(name, samples)
+    else:
+        cmap = matplotlib.cm.get_cmap(name)
+
+    if value_range is not None:
+        lo, hi = value_range
+        lo = float(np.clip(lo, 0.0, 1.0))
+        hi = float(np.clip(hi, lo + 1e-6, 1.0))
+        sample_count = samples or 256
+        vals = np.linspace(lo, hi, sample_count)
+        return matplotlib.colors.ListedColormap(cmap(vals))
+
+    if samples is not None and hasattr(cmap, "resampled"):
+        return cmap.resampled(samples)
+    return cmap
 
 
-def build_colormap_lut(name):
-    cmap = get_colormap(name, 256)
+def body_mask_from_pixel(pixel_data):
+    pixel_data = np.asarray(pixel_data, dtype=np.float64)
+    return pixel_data > np.percentile(pixel_data, 50)
+
+
+def percentile_range_in_mask(x, mask=None, lo=1, hi=99, fallback=None):
+    valid = np.asarray(x, dtype=np.float64)
+    if mask is not None:
+        mask = np.asarray(mask, dtype=bool)
+        if mask.shape == valid.shape:
+            valid = valid[mask]
+    valid = valid[np.isfinite(valid)]
+    if valid.size == 0:
+        return fallback if fallback is not None else (-1.0, 1.0)
+    lo_v = float(np.percentile(valid, lo))
+    hi_v = float(np.percentile(valid, hi))
+    if hi_v - lo_v < 1e-6:
+        center = float(np.median(valid))
+        span = max(float(np.std(valid)), 1e-3)
+        lo_v = center - span
+        hi_v = center + span
+    return lo_v, hi_v
+
+
+def build_colormap_lut(name, value_range=None):
+    cmap = get_colormap(name, 256, value_range=value_range)
     lut = (cmap(np.linspace(0.0, 1.0, 256))[:, :3] * 255.0).round().astype(np.uint8)
     return lut.tolist()
 
 
-def build_colormap_css_gradient(name, steps=16):
-    cmap = get_colormap(name, steps)
+def build_colormap_css_gradient(name, steps=16, value_range=None):
+    cmap = get_colormap(name, steps, value_range=value_range)
     stops = []
     for idx, rgba in enumerate(cmap(np.linspace(0.0, 1.0, steps))):
         pct = 100.0 * idx / max(steps - 1, 1)
@@ -191,8 +243,9 @@ def build_colormap_css_gradient(name, steps=16):
 
 def build_iodine_interactive_payload(pixel_data, iodine_full, kedge_full, overlay_alpha=0.45):
     p_lo, p_hi = mediastinal_window_limits()
-    i_lo, i_hi = percentile_range(iodine_full)
-    k_lo, k_hi = percentile_range(kedge_full)
+    body = body_mask_from_pixel(pixel_data)
+    i_lo, i_hi = percentile_range_in_mask(iodine_full, body, lo=5, hi=99.5, fallback=(0.0, 1.0))
+    k_lo, k_hi = percentile_range_in_mask(kedge_full, body, lo=5, hi=99.5, fallback=(0.0, 1.0))
     pixel_preview = downsample_for_preview(pixel_data, max_size=1024)
     iodine_preview = downsample_for_preview(iodine_full, max_size=1024)
     kedge_preview = downsample_for_preview(kedge_full, max_size=1024)
@@ -208,10 +261,10 @@ def build_iodine_interactive_payload(pixel_data, iodine_full, kedge_full, overla
         "kedge_threshold_min": float(k_lo),
         "kedge_threshold_max": float(k_hi),
         "overlay_alpha": float(overlay_alpha),
-        "magma_lut": build_colormap_lut("magma"),
-        "magma_gradient": build_colormap_css_gradient("magma", steps=24),
-        "viridis_lut": build_colormap_lut("viridis"),
-        "viridis_gradient": build_colormap_css_gradient("viridis", steps=24),
+        "iodine_lut": build_colormap_lut(IODINE_CMAP_NAME, value_range=IODINE_CMAP_RANGE),
+        "iodine_gradient": build_colormap_css_gradient(IODINE_CMAP_NAME, steps=24, value_range=IODINE_CMAP_RANGE),
+        "kedge_lut": build_colormap_lut(KEDGE_CMAP_NAME, value_range=KEDGE_CMAP_RANGE),
+        "kedge_gradient": build_colormap_css_gradient(KEDGE_CMAP_NAME, steps=24, value_range=KEDGE_CMAP_RANGE),
     }
 
 
@@ -442,16 +495,23 @@ def read_pixel_array(ds):
 
 
 def ordered_dicom_files(data_dir):
-    candidates = []
-    for path in sorted(data_dir.iterdir()):
-        if not path.is_file():
-            continue
+    data_dir = Path(data_dir)
+    if data_dir.is_file():
+        search_paths = [data_dir]
+    else:
+        search_paths = sorted(path for path in data_dir.rglob("*") if path.is_file())
+
+    series_groups = {}
+    fallback_counter = 0
+    for path in search_paths:
         try:
             ds = pydicom.dcmread(str(path), force=True)
         except Exception:
             continue
-        if (0xEFE1, 0x1001) not in ds:
+        if (0x7FE0, 0x0010) not in ds or (0xEFE1, 0x1001) not in ds:
             continue
+
+        series_uid = str(getattr(ds, "SeriesInstanceUID", "")) or "__NO_SERIES__"
         if hasattr(ds, "ImagePositionPatient") and len(ds.ImagePositionPatient) >= 3:
             order_key = float(ds.ImagePositionPatient[2])
         elif hasattr(ds, "SliceLocation"):
@@ -459,10 +519,26 @@ def ordered_dicom_files(data_dir):
         elif hasattr(ds, "InstanceNumber"):
             order_key = float(ds.InstanceNumber)
         else:
-            order_key = float(len(candidates))
-        candidates.append((order_key, path))
-    candidates.sort(key=lambda item: item[0])
-    return [path for _, path in candidates]
+            order_key = float(fallback_counter)
+            fallback_counter += 1
+
+        series_groups.setdefault(series_uid, []).append((order_key, path))
+
+    if not series_groups:
+        return []
+
+    # Prefer the largest valid series so roots containing multiple exports can
+    # still be used directly.
+    best_series_uid, best_items = max(
+        series_groups.items(),
+        key=lambda item: (
+            len(item[1]),
+            sum(1 for _, p in item[1] if p.parent == data_dir) if data_dir.is_dir() else 0,
+            item[0],
+        ),
+    )
+    best_items.sort(key=lambda item: (item[0], item[1].name))
+    return [path for _, path in best_items]
 
 
 def compute_slice_products(ds, prefix):
@@ -575,22 +651,28 @@ def build_volume_mpr_figure(pixel_volume, iodine_volume, kedge_volume):
     x = pixel_volume.shape[2] // 2
     views = [
         ("原始体数据 Axial", pixel_volume[z], "gray"),
-        ("碘体数据 Axial", iodine_volume[z], "magma"),
-        ("K-edge 体数据 Axial", kedge_volume[z], "viridis"),
+        ("碘体数据 Axial", iodine_volume[z], "iodine"),
+        ("K-edge 体数据 Axial", kedge_volume[z], "kedge"),
         ("原始体数据 Coronal", np.flipud(pixel_volume[:, y, :]), "gray"),
-        ("碘体数据 Coronal", np.flipud(iodine_volume[:, y, :]), "magma"),
-        ("K-edge 体数据 Coronal", np.flipud(kedge_volume[:, y, :]), "viridis"),
+        ("碘体数据 Coronal", np.flipud(iodine_volume[:, y, :]), "iodine"),
+        ("K-edge 体数据 Coronal", np.flipud(kedge_volume[:, y, :]), "kedge"),
         ("原始体数据 Sagittal", np.flipud(pixel_volume[:, :, x]), "gray"),
-        ("碘体数据 Sagittal", np.flipud(iodine_volume[:, :, x]), "magma"),
-        ("K-edge 体数据 Sagittal", np.flipud(kedge_volume[:, :, x]), "viridis"),
+        ("碘体数据 Sagittal", np.flipud(iodine_volume[:, :, x]), "iodine"),
+        ("K-edge 体数据 Sagittal", np.flipud(kedge_volume[:, :, x]), "kedge"),
     ]
     fig, axes = plt.subplots(3, 3, figsize=(15, 15))
     for ax, (title, img, cmap) in zip(axes.ravel(), views):
         if cmap == "gray":
             v1, v2 = mediastinal_window_limits()
+            cmap_obj = "gray"
         else:
-            v1, v2 = percentile_range(img, 1, 99)
-        im = ax.imshow(img, cmap=cmap, vmin=v1, vmax=v2)
+            view_body = body_mask_from_pixel(img) if img.shape == pixel_volume[z].shape else (np.asarray(img) > np.percentile(img, 50))
+            v1, v2 = percentile_range_in_mask(img, view_body, 5, 99.5, fallback=(0.0, 1.0))
+            cmap_obj = get_colormap(
+                IODINE_CMAP_NAME if cmap == "iodine" else KEDGE_CMAP_NAME,
+                value_range=IODINE_CMAP_RANGE if cmap == "iodine" else KEDGE_CMAP_RANGE,
+            )
+        im = ax.imshow(img, cmap=cmap_obj, vmin=v1, vmax=v2)
         ax.set_title(title, fontsize=10)
         ax.axis("off")
         if cmap != "gray":
@@ -729,7 +811,24 @@ def normalize_in_mask(x, mask):
 
 
 def project_out(signal, nuisance_columns):
-    coef = np.linalg.lstsq(nuisance_columns, signal, rcond=None)[0]
+    signal = np.asarray(signal, dtype=np.float64).reshape(-1)
+    nuisance_columns = np.asarray(nuisance_columns, dtype=np.float64)
+    if nuisance_columns.ndim == 1:
+        nuisance_columns = nuisance_columns[:, None]
+    if nuisance_columns.shape[0] != signal.shape[0]:
+        raise ValueError(
+            f"project_out shape mismatch: signal={signal.shape}, nuisance={nuisance_columns.shape}"
+        )
+
+    # Avoid MKL DGELSD issues on some environments by solving the tiny
+    # regularized normal equations directly.
+    gram = nuisance_columns.T @ nuisance_columns
+    rhs = nuisance_columns.T @ signal
+    reg = 1e-8 * np.eye(gram.shape[0], dtype=np.float64)
+    try:
+        coef = np.linalg.solve(gram + reg, rhs)
+    except np.linalg.LinAlgError:
+        coef = np.matmul(np.linalg.pinv(gram + reg), rhs)
     return signal - nuisance_columns @ coef
 
 
@@ -927,8 +1026,11 @@ def build_overview_figure(pixel_data, structure_base, iodine_full, kedge_full):
 
     p_lo, p_hi = mediastinal_window_limits()
     d_lo, d_hi = percentile_range(structure_base)
-    i_lo, i_hi = percentile_range(iodine_full)
-    k_lo, k_hi = percentile_range(kedge_full)
+    body = body_mask_from_pixel(pixel_data)
+    i_lo, i_hi = percentile_range_in_mask(iodine_full, body, 5, 99.5, fallback=(0.0, 1.0))
+    k_lo, k_hi = percentile_range_in_mask(kedge_full, body, 5, 99.5, fallback=(0.0, 1.0))
+    iodine_cmap = get_colormap(IODINE_CMAP_NAME, value_range=IODINE_CMAP_RANGE)
+    kedge_cmap = get_colormap(KEDGE_CMAP_NAME, value_range=KEDGE_CMAP_RANGE)
 
     axes[0, 0].imshow(pixel_data, cmap="gray", vmin=p_lo, vmax=p_hi)
     axes[0, 0].set_title("PixelData")
@@ -938,24 +1040,24 @@ def build_overview_figure(pixel_data, structure_base, iodine_full, kedge_full):
     axes[0, 1].set_title("结构底图 G3 - G2")
     axes[0, 1].axis("off")
 
-    iodine_im = axes[0, 2].imshow(iodine_full, cmap="magma", vmin=i_lo, vmax=i_hi)
+    iodine_im = axes[0, 2].imshow(iodine_full, cmap=iodine_cmap, vmin=i_lo, vmax=i_hi)
     axes[0, 2].set_title("碘权重图")
     axes[0, 2].axis("off")
     add_threshold_colorbar(fig, axes[0, 2], iodine_im, i_lo, i_hi, "碘权重")
 
-    kedge_im = axes[1, 0].imshow(kedge_full, cmap="viridis", vmin=k_lo, vmax=k_hi)
+    kedge_im = axes[1, 0].imshow(kedge_full, cmap=kedge_cmap, vmin=k_lo, vmax=k_hi)
     axes[1, 0].set_title("K-edge 权重图")
     axes[1, 0].axis("off")
     add_threshold_colorbar(fig, axes[1, 0], kedge_im, k_lo, k_hi, "K-edge 权重")
 
     axes[1, 1].imshow(pixel_data, cmap="gray", vmin=p_lo, vmax=p_hi)
-    iodine_overlay_im = axes[1, 1].imshow(iodine_full, cmap="magma", alpha=0.45, vmin=i_lo, vmax=i_hi)
+    iodine_overlay_im = axes[1, 1].imshow(iodine_full, cmap=iodine_cmap, alpha=0.55, vmin=i_lo, vmax=i_hi)
     axes[1, 1].set_title("PixelData + 碘叠加")
     axes[1, 1].axis("off")
     add_threshold_colorbar(fig, axes[1, 1], iodine_overlay_im, i_lo, i_hi, "碘叠加")
 
     axes[1, 2].imshow(pixel_data, cmap="gray", vmin=p_lo, vmax=p_hi)
-    kedge_overlay_im = axes[1, 2].imshow(kedge_full, cmap="viridis", alpha=0.45, vmin=k_lo, vmax=k_hi)
+    kedge_overlay_im = axes[1, 2].imshow(kedge_full, cmap=kedge_cmap, alpha=0.55, vmin=k_lo, vmax=k_hi)
     axes[1, 2].set_title("PixelData + K-edge 叠加")
     axes[1, 2].axis("off")
     add_threshold_colorbar(fig, axes[1, 2], kedge_overlay_im, k_lo, k_hi, "K-edge 叠加")
@@ -1142,6 +1244,40 @@ def write_html(
 </div>
 <div class="interactive-stage">
 <div class="interactive-panel">
+<div class="interactive-panel-title">碘权重图</div>
+<div class="interactive-canvas-wrap">
+<canvas id="iodine-map-canvas" width="{iodine_interactive['width']}" height="{iodine_interactive['height']}"></canvas>
+</div>
+<div class="interactive-scale-wrap">
+<div class="interactive-scale-title">碘配色范围</div>
+<div class="interactive-scale-track">
+<div class="interactive-scale-gradient" style="background:{iodine_interactive['iodine_gradient']}"></div>
+<div id="iodine-map-marker" class="interactive-scale-marker"></div>
+</div>
+<div class="interactive-scale-labels">
+<span>{iodine_interactive['threshold_max']:.3f}</span>
+<span>{iodine_interactive['threshold_min']:.3f}</span>
+</div>
+</div>
+</div>
+<div class="interactive-panel">
+<div class="interactive-panel-title">K-edge 权重图</div>
+<div class="interactive-canvas-wrap">
+<canvas id="kedge-map-canvas" width="{iodine_interactive['width']}" height="{iodine_interactive['height']}"></canvas>
+</div>
+<div class="interactive-scale-wrap">
+<div class="interactive-scale-title">K-edge 配色范围</div>
+<div class="interactive-scale-track">
+<div class="interactive-scale-gradient" style="background:{iodine_interactive['kedge_gradient']}"></div>
+<div id="kedge-map-marker" class="interactive-scale-marker"></div>
+</div>
+<div class="interactive-scale-labels">
+<span>{iodine_interactive['kedge_threshold_max']:.3f}</span>
+<span>{iodine_interactive['kedge_threshold_min']:.3f}</span>
+</div>
+</div>
+</div>
+<div class="interactive-panel">
 <div class="interactive-panel-title">碘叠加视图</div>
 <div class="interactive-canvas-wrap">
 <canvas id="iodine-threshold-canvas" width="{iodine_interactive['width']}" height="{iodine_interactive['height']}"></canvas>
@@ -1149,7 +1285,7 @@ def write_html(
 <div class="interactive-scale-wrap">
 <div class="interactive-scale-title">碘配色范围</div>
 <div class="interactive-scale-track">
-<div class="interactive-scale-gradient" style="background:{iodine_interactive['magma_gradient']}"></div>
+<div class="interactive-scale-gradient" style="background:{iodine_interactive['iodine_gradient']}"></div>
 <div id="iodine-threshold-marker" class="interactive-scale-marker"></div>
 </div>
 <div class="interactive-scale-labels">
@@ -1166,7 +1302,7 @@ def write_html(
 <div class="interactive-scale-wrap">
 <div class="interactive-scale-title">K-edge 配色范围</div>
 <div class="interactive-scale-track">
-<div class="interactive-scale-gradient" style="background:{iodine_interactive['viridis_gradient']}"></div>
+<div class="interactive-scale-gradient" style="background:{iodine_interactive['kedge_gradient']}"></div>
 <div id="kedge-threshold-marker" class="interactive-scale-marker"></div>
 </div>
 <div class="interactive-scale-labels">
@@ -1177,7 +1313,7 @@ def write_html(
 </div>
 </div>
 <div class="note">
-当前交互视图使用下采样预览图以提升滑动流畅度。滑块以碘阈值为基准，同时按相同归一化比例联动 K-edge 视图。两张图中高于各自阈值的像素继续使用当前配色叠加，低于阈值的像素恢复为原始灰阶。
+当前交互视图使用下采样预览图以提升滑动流畅度。滑块以碘阈值为基准，同时按相同归一化比例联动 K-edge 视图。权重图和叠加图都会联动更新；低于阈值的像素在权重图中转为灰阶，在叠加图中恢复为原始纵膈窗灰阶。
 </div>
 <img id="iodine-base-img" class="hidden-asset" src="data:image/png;base64,{iodine_interactive['pixel_png']}" alt="iodine-base">
 <img id="iodine-mask-img" class="hidden-asset" src="data:image/png;base64,{iodine_interactive['iodine_png']}" alt="iodine-mask">
@@ -1189,24 +1325,30 @@ def write_html(
 (() => {{
   const slider = document.getElementById("iodine-threshold-slider");
   const valueEl = document.getElementById("iodine-threshold-value");
+  const iodineMapCanvas = document.getElementById("iodine-map-canvas");
+  const kedgeMapCanvas = document.getElementById("kedge-map-canvas");
   const iodineCanvas = document.getElementById("iodine-threshold-canvas");
   const kedgeCanvas = document.getElementById("kedge-threshold-canvas");
+  const iodineMapMarker = document.getElementById("iodine-map-marker");
+  const kedgeMapMarker = document.getElementById("kedge-map-marker");
   const iodineMarker = document.getElementById("iodine-threshold-marker");
   const kedgeMarker = document.getElementById("kedge-threshold-marker");
   const baseImg = document.getElementById("iodine-base-img");
   const iodineMaskImg = document.getElementById("iodine-mask-img");
   const kedgeMaskImg = document.getElementById("kedge-mask-img");
-  if (!slider || !valueEl || !iodineCanvas || !kedgeCanvas || !iodineMarker || !kedgeMarker || !baseImg || !iodineMaskImg || !kedgeMaskImg) {{
+  if (!slider || !valueEl || !iodineMapCanvas || !kedgeMapCanvas || !iodineCanvas || !kedgeCanvas || !iodineMapMarker || !kedgeMapMarker || !iodineMarker || !kedgeMarker || !baseImg || !iodineMaskImg || !kedgeMaskImg) {{
     return;
   }}
 
-  const iodineLut = {json.dumps(iodine_interactive["magma_lut"])};
-  const kedgeLut = {json.dumps(iodine_interactive["viridis_lut"])};
+  const iodineLut = {json.dumps(iodine_interactive["iodine_lut"])};
+  const kedgeLut = {json.dumps(iodine_interactive["kedge_lut"])};
   const iodineThresholdMin = {iodine_interactive['threshold_min']:.12f};
   const iodineThresholdMax = {iodine_interactive['threshold_max']:.12f};
   const kedgeThresholdMin = {iodine_interactive['kedge_threshold_min']:.12f};
   const kedgeThresholdMax = {iodine_interactive['kedge_threshold_max']:.12f};
   const overlayAlpha = {iodine_interactive['overlay_alpha']:.12f};
+  const iodineMapCtx = iodineMapCanvas.getContext("2d", {{ willReadFrequently: true }});
+  const kedgeMapCtx = kedgeMapCanvas.getContext("2d", {{ willReadFrequently: true }});
   const iodineCtx = iodineCanvas.getContext("2d", {{ willReadFrequently: true }});
   const kedgeCtx = kedgeCanvas.getContext("2d", {{ willReadFrequently: true }});
   const offscreenBase = document.createElement("canvas");
@@ -1225,9 +1367,33 @@ def write_html(
   }}
 
   function updateMarkers(iodineThreshold, kedgeThreshold, ratio) {{
+    iodineMapMarker.style.top = `${{(1 - ratio) * 100}}%`;
+    kedgeMapMarker.style.top = `${{(1 - ratio) * 100}}%`;
     iodineMarker.style.top = `${{(1 - ratio) * 100}}%`;
     kedgeMarker.style.top = `${{(1 - ratio) * 100}}%`;
     valueEl.textContent = `碘阈值 ${{iodineThreshold.toFixed(3)}} / K-edge 联动阈值 ${{kedgeThreshold.toFixed(3)}}`;
+  }}
+
+  function renderWeightMap(ctx, canvas, maskPixels, lut, thresholdNorm) {{
+    const out = ctx.createImageData(canvas.width, canvas.height);
+    const dst = out.data;
+    for (let i = 0; i < dst.length; i += 4) {{
+      const maskGray = maskPixels[i];
+      const overlayNorm = maskGray / 255;
+      if (overlayNorm >= thresholdNorm) {{
+        const lutIdx = Math.min(255, Math.max(0, Math.round(overlayNorm * 255)));
+        const rgb = lut[lutIdx];
+        dst[i] = rgb[0];
+        dst[i + 1] = rgb[1];
+        dst[i + 2] = rgb[2];
+      }} else {{
+        dst[i] = maskGray;
+        dst[i + 1] = maskGray;
+        dst[i + 2] = maskGray;
+      }}
+      dst[i + 3] = 255;
+    }}
+    ctx.putImageData(out, 0, 0);
   }}
 
   function renderOverlay(ctx, canvas, maskPixels, lut, thresholdNorm) {{
@@ -1260,6 +1426,8 @@ def write_html(
     const ratio = clampRatio(iodineThreshold, iodineThresholdMin, iodineThresholdMax);
     const kedgeThreshold = kedgeThresholdMin + ratio * (kedgeThresholdMax - kedgeThresholdMin);
     updateMarkers(iodineThreshold, kedgeThreshold, ratio);
+    renderWeightMap(iodineMapCtx, iodineMapCanvas, iodineMaskPixels, iodineLut, ratio);
+    renderWeightMap(kedgeMapCtx, kedgeMapCanvas, kedgeMaskPixels, kedgeLut, ratio);
     renderOverlay(iodineCtx, iodineCanvas, iodineMaskPixels, iodineLut, ratio);
     renderOverlay(kedgeCtx, kedgeCanvas, kedgeMaskPixels, kedgeLut, ratio);
   }}
@@ -1267,6 +1435,10 @@ def write_html(
   function primePixels() {{
     const width = baseImg.naturalWidth || baseImg.width;
     const height = baseImg.naturalHeight || baseImg.height;
+    iodineMapCanvas.width = width;
+    iodineMapCanvas.height = height;
+    kedgeMapCanvas.width = width;
+    kedgeMapCanvas.height = height;
     iodineCanvas.width = width;
     iodineCanvas.height = height;
     kedgeCanvas.width = width;
@@ -1493,7 +1665,7 @@ code{{font-family:Consolas,monospace;background:#161b22;padding:1px 4px;border-r
 <li><b>伪彩是怎么得到的</b><br>
 DICOM 导出时保存的是单通道灰度权重值，不直接存 RGB 伪彩。HTML 报告中做伪彩有两种方式：
 <ul>
-<li>单独显示：把权重图映射到 <code>magma</code>（碘）或 <code>viridis</code>（K-edge）色表。</li>
+<li>单独显示：把权重图映射到截断后的 <code>magma</code>（碘）和 <code>viridis</code>（K-edge）色表，避免高端颜色过白。</li>
 <li>叠加显示：先显示灰度 <code>PixelData</code>，再把归一化权重作为 alpha/颜色层覆盖上去。</li>
 </ul>
 所以“伪彩权重图”本质上是 <b>灰度权重 + 浏览器中的色表映射</b>，而不是 DICOM 原生存储的彩色图。</li>
