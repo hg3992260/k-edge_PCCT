@@ -63,19 +63,16 @@ jobs:
           python -m pip --version
           python -m pip install --upgrade pip
           python -m pip install -r requirements-desktop-build.txt
-          python -m pip uninstall -y torch || true
-          python -m pip install --no-cache-dir --force-reinstall --index-url https://download.pytorch.org/whl/cu121 "torch==2.5.1+cu121"
 
       - name: Show Build Environment
         run: |
           python --version
           python -m pip --version
           conda info
-          conda list | grep -E "openjpeg|pyqt|pyinstaller|glymur|pydicom|numpy|scipy|matplotlib|pillow|torch" || true
+          conda list | grep -E "openjpeg|pyqt|pyinstaller|glymur|pydicom|numpy|scipy|matplotlib|pillow" || true
           python - <<'PY'
           import os
           from pathlib import Path
-          import torch
           candidates = []
           conda_prefix = os.environ.get("CONDA_PREFIX")
           if conda_prefix:
@@ -87,16 +84,9 @@ jobs:
               )
           for item in candidates:
               print(f"CHECK_OPENJP2 {item} exists={item.exists()}")
-          print(f"TORCH_VERSION {torch.__version__}")
-          print(f"TORCH_CUDA_RUNTIME {torch.version.cuda}")
-          print(f"TORCH_CUDA_AVAILABLE {torch.cuda.is_available()}")
-          if not str(torch.version.cuda or "").strip():
-              raise SystemExit("GitHub Actions 未安装到 CUDA 版 PyTorch wheel，停止构建。")
           PY
 
       - name: Build EXE
-        env:
-          KEDGE_DISABLE_CUDA: "1"
         run: |
           python scripts/build_windows_exe.py
 
