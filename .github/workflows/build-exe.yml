@@ -21,6 +21,12 @@ concurrency:
   group: build-windows-exe-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  PYTHONUTF8: "1"
+  PIP_DISABLE_PIP_VERSION_CHECK: "1"
+  PIP_EXTRA_INDEX_URL: https://download.pytorch.org/whl/cu121
+  KMP_DUPLICATE_LIB_OK: "TRUE"
+
 jobs:
   build-windows:
     runs-on: windows-latest
@@ -49,6 +55,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements-desktop-build.txt
+          python -m pip install --extra-index-url https://download.pytorch.org/whl/cu121 "torch>=2.5,<2.8"
 
       - name: Show Build Environment
         run: |
@@ -74,9 +81,13 @@ jobs:
           print(f"TORCH_VERSION {torch.__version__}")
           print(f"TORCH_CUDA_RUNTIME {torch.version.cuda}")
           print(f"TORCH_CUDA_AVAILABLE {torch.cuda.is_available()}")
+          if not str(torch.version.cuda or "").strip():
+              raise SystemExit("GitHub Actions 未安装到 CUDA 版 PyTorch wheel，停止构建。")
           PY
 
       - name: Build EXE
+        env:
+          KEDGE_DISABLE_CUDA: "1"
         run: |
           python scripts/build_windows_exe.py
 
