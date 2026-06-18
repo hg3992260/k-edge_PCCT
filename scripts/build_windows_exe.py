@@ -80,7 +80,7 @@ def build():
         import torch
     except Exception as exc:
         raise RuntimeError(
-            "未检测到 PyTorch。请先按 requirements-desktop-build.txt 安装 GPU 版 torch，再执行 EXE 打包。"
+            "未检测到 PyTorch。请先安装 CUDA 版 torch，再执行 EXE 打包。"
         ) from exc
     DIST_DIR.mkdir(exist_ok=True)
     BUILD_DIR.mkdir(exist_ok=True)
