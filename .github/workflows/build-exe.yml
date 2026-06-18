@@ -55,10 +55,11 @@ jobs:
           python --version
           python -m pip --version
           conda info
-          conda list | grep -E "openjpeg|pyqt|pyinstaller|glymur|pydicom|numpy|scipy|matplotlib|pillow" || true
+          conda list | grep -E "openjpeg|pyqt|pyinstaller|glymur|pydicom|numpy|scipy|matplotlib|pillow|torch" || true
           python - <<'PY'
           import os
           from pathlib import Path
+          import torch
           candidates = []
           conda_prefix = os.environ.get("CONDA_PREFIX")
           if conda_prefix:
@@ -70,6 +71,9 @@ jobs:
               )
           for item in candidates:
               print(f"CHECK_OPENJP2 {item} exists={item.exists()}")
+          print(f"TORCH_VERSION {torch.__version__}")
+          print(f"TORCH_CUDA_RUNTIME {torch.version.cuda}")
+          print(f"TORCH_CUDA_AVAILABLE {torch.cuda.is_available()}")
           PY
 
       - name: Build EXE
