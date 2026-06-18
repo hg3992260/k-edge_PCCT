@@ -91,24 +91,13 @@ def describe_slice(file_path: Path, index: int, total: int) -> str:
 
 
 def build_batch_strategy(slice_count: int) -> dict:
-    if CUDA_ENABLED:
-        gpu_slots = max(1, GPU_COMPUTE_SLOTS)
-        prefetch_workers = max(0, GPU_PREFETCH_WORKERS)
-        batch_workers = min(slice_count, max(1, gpu_slots + prefetch_workers))
-        strategy_name = "PyTorch GPU 加速"
-        strategy_desc = (
-            f"{CUDA_BACKEND} + GPU 计算槽 {gpu_slots} 路"
-            f" / CPU 预取 {prefetch_workers} 路 / 外层线程 {batch_workers} 路"
-            f" / 每层解码线程 {DECODE_THREADS} / OOM 自动回退 CPU"
-        )
-    else:
-        cpu_parallel = max(1, CPU_COUNT // max(DECODE_THREADS, 1))
-        batch_workers = min(slice_count, max(1, min(4, SLICE_WORKERS, cpu_parallel)))
-        strategy_name = "CPU 多线程并行"
-        strategy_desc = (
-            f"CPU / NumPy + CPU 切片并行 {batch_workers} 路"
-            f" / 每层解码线程 {DECODE_THREADS}"
-        )
+    cpu_parallel = max(1, CPU_COUNT // max(DECODE_THREADS, 1))
+    batch_workers = min(slice_count, max(1, min(4, SLICE_WORKERS, cpu_parallel)))
+    strategy_name = "CPU 多线程并行"
+    strategy_desc = (
+        f"CPU / NumPy + CPU 切片并行 {batch_workers} 路"
+        f" / 每层解码线程 {DECODE_THREADS}"
+    )
     return {
         "backend_text": CUDA_BACKEND,
         "strategy_name": strategy_name,
@@ -128,7 +117,6 @@ def format_stage_timings(stage_timings: Optional[dict]) -> str:
         return "无阶段耗时"
     ordered_keys = [
         ("read_dicom_s", "读取"),
-        ("gpu_queue_wait_s", "等GPU"),
         ("compute_products_s", "计算"),
         ("export_dicom_s", "导出DICOM"),
         ("build_figures_s", "绘图"),
@@ -199,6 +187,8 @@ def inspect_existing_report_result(
     existing_fast_mode = bool(meta_payload.get("fast_mode", False))
     dcm_exports_ready = bool(meta_payload.get("dcm_exports_ready", False))
     existing_defer_static_figures = bool(meta_payload.get("defer_static_figures", False))
+    if bool(meta_payload.get("cuda_enabled", False)):
+        return None, "旧缓存来自 PyTorch/GPU 计算路径，已判定失效并重新生成。"
     if not fast_mode and existing_fast_mode and not native_json.exists():
         return None, "旧快速批处理缓存缺少完整结果文件，已判定失效并重新生成。"
     if existing_fast_mode and not dcm_exports_ready:

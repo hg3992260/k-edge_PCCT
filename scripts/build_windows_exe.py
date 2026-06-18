@@ -76,12 +76,6 @@ def find_openjp2_dll() -> Path:
 def build():
     openjp2_dll = find_openjp2_dll()
     icon_path = ensure_windows_icon()
-    try:
-        import torch
-    except Exception as exc:
-        raise RuntimeError(
-            "未检测到 PyTorch。请先安装 CUDA 版 torch，再执行 EXE 打包。"
-        ) from exc
     DIST_DIR.mkdir(exist_ok=True)
     BUILD_DIR.mkdir(exist_ok=True)
     RELEASE_DIR.mkdir(exist_ok=True)
@@ -109,22 +103,12 @@ def build():
         "PyQt5.QtWebEngineCore",
         "--hidden-import",
         "PyQt5.QtWebChannel",
-        "--hidden-import",
-        "torch",
-        "--hidden-import",
-        "torch.nn.functional",
         "--collect-submodules",
         "glymur",
         "--collect-submodules",
         "matplotlib",
-        "--collect-submodules",
-        "torch",
         "--collect-data",
         "matplotlib",
-        "--collect-data",
-        "torch",
-        "--collect-binaries",
-        "torch",
         "--add-data",
         add_data_arg(LOGO_DIR, "reconstructed_weight_maps/logo"),
         "--add-binary",

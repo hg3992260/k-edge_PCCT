@@ -20,12 +20,8 @@ import pydicom
 from pydicom.uid import SecondaryCaptureImageStorage, generate_uid
 from scipy.ndimage import zoom as cpu_zoom
 
-try:
-    import torch
-    import torch.nn.functional as torch_f
-except Exception:
-    torch = None
-    torch_f = None
+torch = None
+torch_f = None
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
@@ -55,7 +51,7 @@ DATA_DIR = Path(os.environ.get("KEDGE_DATA_DIR", str(default_data_dir(ROOT))))
 OUT_DIR = Path(os.environ.get("KEDGE_OUT_DIR", str(ROOT / "reconstructed_weight_maps")))
 CACHE_DIR = Path(os.environ.get("KEDGE_CACHE_DIR", str(ROOT / "_pcct_cache")))
 REPORT_INTERACTION_VERSION = 2
-REPORT_CONTENT_VERSION = 7
+REPORT_CONTENT_VERSION = 8
 KEDGE_MODEL_VERSION = 1
 
 
@@ -67,51 +63,18 @@ def env_flag(name, default=False):
 
 CUDA_ENABLED = False
 CUDA_BACKEND = "CPU / NumPy"
-CUDA_DISABLED_BY_ENV = env_flag("KEDGE_DISABLE_CUDA", False)
+CUDA_DISABLED_BY_ENV = True
 TORCH_CUDA_ENABLED = False
 TORCH_DEVICE = None
 TORCH_CUDA_TOTAL_MEM_BYTES = 0
-TORCH_DISABLED_BY_ENV = env_flag("KEDGE_DISABLE_TORCH", False)
-if not CUDA_DISABLED_BY_ENV and not TORCH_DISABLED_BY_ENV and torch is not None and torch_f is not None:
-    try:
-        if torch.cuda.is_available():
-            CUDA_ENABLED = True
-            TORCH_CUDA_ENABLED = True
-            TORCH_DEVICE = torch.device("cuda:0")
-            CUDA_BACKEND = f"PyTorch CUDA / {torch.cuda.get_device_name(TORCH_DEVICE)}"
-            try:
-                TORCH_CUDA_TOTAL_MEM_BYTES = int(torch.cuda.get_device_properties(TORCH_DEVICE).total_memory)
-            except Exception:
-                TORCH_CUDA_TOTAL_MEM_BYTES = 0
-    except Exception:
-        CUDA_ENABLED = False
-        CUDA_BACKEND = "CPU / NumPy"
-        TORCH_CUDA_ENABLED = False
-        TORCH_DEVICE = None
-        TORCH_CUDA_TOTAL_MEM_BYTES = 0
+TORCH_DISABLED_BY_ENV = True
 
 CPU_COUNT = os.cpu_count() or 1
 
 
-def default_gpu_compute_slots():
-    if not TORCH_CUDA_ENABLED:
-        return 0
-    if TORCH_CUDA_TOTAL_MEM_BYTES >= 16 * 1024**3:
-        return 4
-    if TORCH_CUDA_TOTAL_MEM_BYTES >= 8 * 1024**3:
-        return 3
-    if TORCH_CUDA_TOTAL_MEM_BYTES >= 5 * 1024**3:
-        return 2
-    return 1
-
-
-DEFAULT_GPU_COMPUTE_SLOTS = default_gpu_compute_slots()
-DEFAULT_GPU_PREFETCH_WORKERS = 1 if TORCH_CUDA_ENABLED else 0
-DEFAULT_SLICE_WORKERS = (
-    max(1, DEFAULT_GPU_COMPUTE_SLOTS + DEFAULT_GPU_PREFETCH_WORKERS)
-    if CUDA_ENABLED
-    else min(4, max(CPU_COUNT // 4, 1))
-)
+DEFAULT_GPU_COMPUTE_SLOTS = 0
+DEFAULT_GPU_PREFETCH_WORKERS = 0
+DEFAULT_SLICE_WORKERS = min(4, max(CPU_COUNT // 4, 1))
 SLICE_WORKERS = max(1, int(os.environ.get("KEDGE_SLICE_WORKERS", str(DEFAULT_SLICE_WORKERS))))
 GPU_COMPUTE_SLOTS = (
     max(1, int(os.environ.get("KEDGE_GPU_COMPUTE_SLOTS", str(DEFAULT_GPU_COMPUTE_SLOTS))))
@@ -123,11 +86,7 @@ GPU_PREFETCH_WORKERS = (
     if TORCH_CUDA_ENABLED
     else 0
 )
-DEFAULT_DECODE_THREADS = (
-    min(6, max(CPU_COUNT // max(SLICE_WORKERS, 1), 1))
-    if CUDA_ENABLED
-    else min(8, max(CPU_COUNT // max(SLICE_WORKERS, 1), 1))
-)
+DEFAULT_DECODE_THREADS = min(8, max(CPU_COUNT // max(SLICE_WORKERS, 1), 1))
 DECODE_THREADS = max(1, int(os.environ.get("KEDGE_DECODE_THREADS", str(DEFAULT_DECODE_THREADS))))
 TORCH_EMPTY_CACHE_EACH_SLICE = env_flag("KEDGE_TORCH_EMPTY_CACHE_EACH_SLICE", False)
 FAST_VOLUME_SAVE = env_flag("KEDGE_FAST_VOLUME_SAVE", True)
@@ -1330,183 +1289,138 @@ def compute_slice_products(ds, prefix):
     )
     # #endregion
     gpu_queue_wait_s = 0.0
-    gpu_slot_ctx = gpu_compute_slot() if TORCH_CUDA_ENABLED else nullcontext(0.0)
-    with gpu_slot_ctx as gpu_queue_wait_s:
-        try:
-            if BLOCK_SUPPRESS_ENABLED:
-                if TORCH_CUDA_ENABLED:
-                    band_stack = suppress_band_stack_block_artifacts(
-                        to_device(band_stack_raw),
-                        lowres_body=torch.as_tensor(lowres_body, dtype=torch.bool, device=TORCH_DEVICE),
-                        strength=BLOCK_SUPPRESS_STRENGTH,
-                    )
-                else:
-                    band_stack = suppress_band_stack_block_artifacts(
-                        band_stack_raw,
-                        lowres_body=lowres_body,
-                        strength=BLOCK_SUPPRESS_STRENGTH,
-                    )
-            else:
-                band_stack = to_device(band_stack_raw) if TORCH_CUDA_ENABLED else band_stack_raw
-
-            bin_curve_matrix = compute_bin_curve_matrix(curves)
-            material_weights, kedge_weights, gadolinium_kedge_weights = build_material_weight_vectors(bin_curve_matrix)
-            iodine_weights = material_weights["Iodine"]
-    # #region debug-point C:weights
-            debug_report_event(
-                "C",
-                "build_iodine_kedge_report.py:compute_slice_products:weights",
-                "weight vectors built",
-                data={
-                    "prefix": prefix,
-                    "bin_curve_matrix": np.round(bin_curve_matrix, 6).tolist(),
-                    "water_weights": np.round(material_weights["Water"], 6).tolist(),
-                    "iodine_weights": np.round(iodine_weights, 6).tolist(),
-                    "calcium_weights": np.round(material_weights["Calcium"], 6).tolist(),
-                    "gadolinium_weights": np.round(material_weights["Gadolinium"], 6).tolist(),
-                    "iodine_kedge_weights": np.round(kedge_weights, 6).tolist(),
-                    "gadolinium_kedge_weights": np.round(gadolinium_kedge_weights, 6).tolist(),
-                },
+    try:
+        if BLOCK_SUPPRESS_ENABLED:
+            band_stack = suppress_band_stack_block_artifacts(
+                band_stack_raw,
+                lowres_body=lowres_body,
+                strength=BLOCK_SUPPRESS_STRENGTH,
             )
-    # #endregion
+        else:
+            band_stack = band_stack_raw
 
-            direct_weight_map = dict(material_weights)
-            direct_weight_map["Iodine K-edge"] = kedge_weights
-            direct_weight_map["Gadolinium K-edge"] = gadolinium_kedge_weights
-            low_direct_maps = compute_direct_low_projections(band_stack, direct_weight_map)
-            iodine_low_direct_dbg = as_numpy(low_direct_maps["Iodine"])
-            water_low_direct_dbg = as_numpy(low_direct_maps["Water"])
-            calcium_low_direct_dbg = as_numpy(low_direct_maps["Calcium"])
-            gadolinium_low_direct_dbg = as_numpy(low_direct_maps["Gadolinium"])
-            kedge_low_direct_dbg = as_numpy(low_direct_maps["Iodine K-edge"])
-            gadolinium_kedge_low_direct_dbg = as_numpy(low_direct_maps["Gadolinium K-edge"])
-    # #region debug-point D:direct-low
-            debug_report_event(
-                "D",
-                "build_iodine_kedge_report.py:compute_slice_products:direct_low",
-                "direct low projections computed",
-                data={
-                    "prefix": prefix,
-                    "water_low_min": float(np.min(water_low_direct_dbg)),
-                    "water_low_max": float(np.max(water_low_direct_dbg)),
-                    "water_low_mean": float(np.mean(water_low_direct_dbg)),
-                    "iodine_low_min": float(np.min(iodine_low_direct_dbg)),
-                    "iodine_low_max": float(np.max(iodine_low_direct_dbg)),
-                    "iodine_low_mean": float(np.mean(iodine_low_direct_dbg)),
-                    "calcium_low_min": float(np.min(calcium_low_direct_dbg)),
-                    "calcium_low_max": float(np.max(calcium_low_direct_dbg)),
-                    "calcium_low_mean": float(np.mean(calcium_low_direct_dbg)),
-                    "gadolinium_low_min": float(np.min(gadolinium_low_direct_dbg)),
-                    "gadolinium_low_max": float(np.max(gadolinium_low_direct_dbg)),
-                    "gadolinium_low_mean": float(np.mean(gadolinium_low_direct_dbg)),
-                    "iodine_kedge_low_min": float(np.min(kedge_low_direct_dbg)),
-                    "iodine_kedge_low_max": float(np.max(kedge_low_direct_dbg)),
-                    "iodine_kedge_low_mean": float(np.mean(kedge_low_direct_dbg)),
-                    "gadolinium_kedge_low_min": float(np.min(gadolinium_kedge_low_direct_dbg)),
-                    "gadolinium_kedge_low_max": float(np.max(gadolinium_kedge_low_direct_dbg)),
-                    "gadolinium_kedge_low_mean": float(np.mean(gadolinium_kedge_low_direct_dbg)),
-                },
-            )
-    # #endregion
+        bin_curve_matrix = compute_bin_curve_matrix(curves)
+        material_weights, kedge_weights, gadolinium_kedge_weights = build_material_weight_vectors(bin_curve_matrix)
+        iodine_weights = material_weights["Iodine"]
+        # #region debug-point C:weights
+        debug_report_event(
+            "C",
+            "build_iodine_kedge_report.py:compute_slice_products:weights",
+            "weight vectors built",
+            data={
+                "prefix": prefix,
+                "bin_curve_matrix": np.round(bin_curve_matrix, 6).tolist(),
+                "water_weights": np.round(material_weights["Water"], 6).tolist(),
+                "iodine_weights": np.round(iodine_weights, 6).tolist(),
+                "calcium_weights": np.round(material_weights["Calcium"], 6).tolist(),
+                "gadolinium_weights": np.round(material_weights["Gadolinium"], 6).tolist(),
+                "iodine_kedge_weights": np.round(kedge_weights, 6).tolist(),
+                "gadolinium_kedge_weights": np.round(gadolinium_kedge_weights, 6).tolist(),
+            },
+        )
+        # #endregion
 
-            low_maps = {}
-            row_profiles = {}
-            col_profiles = {}
-            structure_base_dev = to_device(structure_base) if CUDA_ENABLED else None
-            pixel_data_dev = to_device(pixel_data) if CUDA_ENABLED else None
-            lowres_body_dev = (
-                torch.as_tensor(lowres_body, dtype=torch.bool, device=TORCH_DEVICE)
-                if TORCH_CUDA_ENABLED and TORCH_DEVICE is not None
-                else None
-            )
-            if RECON_MODE == "spectral_prior":
-                if TORCH_CUDA_ENABLED:
-                    direct_low_names = list(low_direct_maps.keys())
-                    direct_low_stack = torch.stack([to_device(low_direct_maps[name]) for name in direct_low_names], dim=0)
-                    low_map_stack, direct_low_stack, row_profile_stack, col_profile_stack = build_spectral_prior_lowres_batch(
-                        direct_low_stack,
-                        pixel_data_dev,
-                        structure_base_dev,
-                        lowres_body_dev,
-                    )
-                    for idx, name in enumerate(direct_low_names):
-                        low_maps[name] = low_map_stack[idx]
-                        low_direct_maps[name] = direct_low_stack[idx]
-                        row_profiles[name] = row_profile_stack[idx]
-                        col_profiles[name] = col_profile_stack[idx]
-                else:
-                    for name, direct_low in low_direct_maps.items():
-                        low_map, direct_low, row_profile, col_profile = build_spectral_prior_lowres(
-                            direct_low,
-                            pixel_data,
-                            structure_base,
-                            lowres_body,
-                        )
-                        low_maps[name] = low_map
-                        low_direct_maps[name] = direct_low
-                        row_profiles[name] = row_profile
-                        col_profiles[name] = col_profile
-            else:
-                for name, direct_low in low_direct_maps.items():
-                    low_map = to_device(direct_low) if TORCH_CUDA_ENABLED else np.asarray(direct_low, dtype=np.float64)
-                    row_step, col_step = adaptive_lowres_block_shape(low_map.shape)
-                    if BLOCK_SUPPRESS_ENABLED:
-                        low_map = suppress_lowres_block_artifacts(
-                            low_map,
-                            strength=PROJECTION_BLOCK_SUPPRESS_STRENGTH,
-                            mask=lowres_body_dev if TORCH_CUDA_ENABLED else lowres_body,
-                            row_step=row_step,
-                            col_step=col_step,
-                        )
-                    low_maps[name] = low_map
-                    row_profiles[name] = masked_profile_median(
-                        low_map, lowres_body_dev if TORCH_CUDA_ENABLED else lowres_body, axis=1
-                    )
-                    col_profiles[name] = masked_profile_median(
-                        low_map, lowres_body_dev if TORCH_CUDA_ENABLED else lowres_body, axis=0
-                    )
+        direct_weight_map = dict(material_weights)
+        direct_weight_map["Iodine K-edge"] = kedge_weights
+        direct_weight_map["Gadolinium K-edge"] = gadolinium_kedge_weights
+        low_direct_maps = compute_direct_low_projections(band_stack, direct_weight_map)
+        iodine_low_direct_dbg = as_numpy(low_direct_maps["Iodine"])
+        water_low_direct_dbg = as_numpy(low_direct_maps["Water"])
+        calcium_low_direct_dbg = as_numpy(low_direct_maps["Calcium"])
+        gadolinium_low_direct_dbg = as_numpy(low_direct_maps["Gadolinium"])
+        kedge_low_direct_dbg = as_numpy(low_direct_maps["Iodine K-edge"])
+        gadolinium_kedge_low_direct_dbg = as_numpy(low_direct_maps["Gadolinium K-edge"])
+        # #region debug-point D:direct-low
+        debug_report_event(
+            "D",
+            "build_iodine_kedge_report.py:compute_slice_products:direct_low",
+            "direct low projections computed",
+            data={
+                "prefix": prefix,
+                "water_low_min": float(np.min(water_low_direct_dbg)),
+                "water_low_max": float(np.max(water_low_direct_dbg)),
+                "water_low_mean": float(np.mean(water_low_direct_dbg)),
+                "iodine_low_min": float(np.min(iodine_low_direct_dbg)),
+                "iodine_low_max": float(np.max(iodine_low_direct_dbg)),
+                "iodine_low_mean": float(np.mean(iodine_low_direct_dbg)),
+                "calcium_low_min": float(np.min(calcium_low_direct_dbg)),
+                "calcium_low_max": float(np.max(calcium_low_direct_dbg)),
+                "calcium_low_mean": float(np.mean(calcium_low_direct_dbg)),
+                "gadolinium_low_min": float(np.min(gadolinium_low_direct_dbg)),
+                "gadolinium_low_max": float(np.max(gadolinium_low_direct_dbg)),
+                "gadolinium_low_mean": float(np.mean(gadolinium_low_direct_dbg)),
+                "iodine_kedge_low_min": float(np.min(kedge_low_direct_dbg)),
+                "iodine_kedge_low_max": float(np.max(kedge_low_direct_dbg)),
+                "iodine_kedge_low_mean": float(np.mean(kedge_low_direct_dbg)),
+                "gadolinium_kedge_low_min": float(np.min(gadolinium_kedge_low_direct_dbg)),
+                "gadolinium_kedge_low_max": float(np.max(gadolinium_kedge_low_direct_dbg)),
+                "gadolinium_kedge_low_mean": float(np.mean(gadolinium_kedge_low_direct_dbg)),
+            },
+        )
+        # #endregion
 
-            iodine_low_direct = as_numpy(low_direct_maps["Iodine"])
-            water_low_direct = as_numpy(low_direct_maps["Water"])
-            calcium_low_direct = as_numpy(low_direct_maps["Calcium"])
-            gadolinium_low_direct = as_numpy(low_direct_maps["Gadolinium"])
-            kedge_low_direct = as_numpy(low_direct_maps["Iodine K-edge"])
-            gadolinium_kedge_low_direct = as_numpy(low_direct_maps["Gadolinium K-edge"])
-            iodine_low = as_numpy(low_maps["Iodine"])
-            water_low = as_numpy(low_maps["Water"])
-            calcium_low = as_numpy(low_maps["Calcium"])
-            gadolinium_low = as_numpy(low_maps["Gadolinium"])
-            kedge_low = as_numpy(low_maps["Iodine K-edge"])
-            gadolinium_kedge_low = as_numpy(low_maps["Gadolinium K-edge"])
-            iodine_row_profile = as_numpy(row_profiles["Iodine"])
-            water_row_profile = as_numpy(row_profiles["Water"])
-            calcium_row_profile = as_numpy(row_profiles["Calcium"])
-            gadolinium_row_profile = as_numpy(row_profiles["Gadolinium"])
-            kedge_row_profile = as_numpy(row_profiles["Iodine K-edge"])
-            gadolinium_kedge_row_profile = as_numpy(row_profiles["Gadolinium K-edge"])
-            iodine_col_profile = as_numpy(col_profiles["Iodine"])
-            water_col_profile = as_numpy(col_profiles["Water"])
-            calcium_col_profile = as_numpy(col_profiles["Calcium"])
-            gadolinium_col_profile = as_numpy(col_profiles["Gadolinium"])
-            kedge_col_profile = as_numpy(col_profiles["Iodine K-edge"])
-            gadolinium_kedge_col_profile = as_numpy(col_profiles["Gadolinium K-edge"])
-
-            full_maps = {}
-            coarse_maps = {}
-            if CUDA_ENABLED:
-                for name, low_map in low_maps.items():
-                    full_map_dev, coarse_map_dev = fuse_structure_preserving_map(
-                        structure_base_dev, to_device(low_map), pixel_data_dev
+        low_maps = {}
+        row_profiles = {}
+        col_profiles = {}
+        if RECON_MODE == "spectral_prior":
+            for name, direct_low in low_direct_maps.items():
+                low_map, direct_low, row_profile, col_profile = build_spectral_prior_lowres(
+                    direct_low,
+                    pixel_data,
+                    structure_base,
+                    lowres_body,
+                )
+                low_maps[name] = low_map
+                low_direct_maps[name] = direct_low
+                row_profiles[name] = row_profile
+                col_profiles[name] = col_profile
+        else:
+            for name, direct_low in low_direct_maps.items():
+                low_map = np.asarray(direct_low, dtype=np.float64)
+                row_step, col_step = adaptive_lowres_block_shape(low_map.shape)
+                if BLOCK_SUPPRESS_ENABLED:
+                    low_map = suppress_lowres_block_artifacts(
+                        low_map,
+                        strength=PROJECTION_BLOCK_SUPPRESS_STRENGTH,
+                        mask=lowres_body,
+                        row_step=row_step,
+                        col_step=col_step,
                     )
-                    full_maps[name] = as_numpy(full_map_dev)
-                    coarse_maps[name] = as_numpy(coarse_map_dev)
-                release_torch_cuda_cache(force=False)
-            else:
-                for name, low_map in low_maps.items():
-                    full_maps[name], coarse_maps[name] = fuse_structure_preserving_map(structure_base, low_map, pixel_data)
-        except Exception:
-            release_torch_cuda_cache(force=True)
-            raise
+                low_maps[name] = low_map
+                row_profiles[name] = masked_profile_median(low_map, lowres_body, axis=1)
+                col_profiles[name] = masked_profile_median(low_map, lowres_body, axis=0)
+
+        iodine_low_direct = as_numpy(low_direct_maps["Iodine"])
+        water_low_direct = as_numpy(low_direct_maps["Water"])
+        calcium_low_direct = as_numpy(low_direct_maps["Calcium"])
+        gadolinium_low_direct = as_numpy(low_direct_maps["Gadolinium"])
+        kedge_low_direct = as_numpy(low_direct_maps["Iodine K-edge"])
+        gadolinium_kedge_low_direct = as_numpy(low_direct_maps["Gadolinium K-edge"])
+        iodine_low = as_numpy(low_maps["Iodine"])
+        water_low = as_numpy(low_maps["Water"])
+        calcium_low = as_numpy(low_maps["Calcium"])
+        gadolinium_low = as_numpy(low_maps["Gadolinium"])
+        kedge_low = as_numpy(low_maps["Iodine K-edge"])
+        gadolinium_kedge_low = as_numpy(low_maps["Gadolinium K-edge"])
+        iodine_row_profile = as_numpy(row_profiles["Iodine"])
+        water_row_profile = as_numpy(row_profiles["Water"])
+        calcium_row_profile = as_numpy(row_profiles["Calcium"])
+        gadolinium_row_profile = as_numpy(row_profiles["Gadolinium"])
+        kedge_row_profile = as_numpy(row_profiles["Iodine K-edge"])
+        gadolinium_kedge_row_profile = as_numpy(row_profiles["Gadolinium K-edge"])
+        iodine_col_profile = as_numpy(col_profiles["Iodine"])
+        water_col_profile = as_numpy(col_profiles["Water"])
+        calcium_col_profile = as_numpy(col_profiles["Calcium"])
+        gadolinium_col_profile = as_numpy(col_profiles["Gadolinium"])
+        kedge_col_profile = as_numpy(col_profiles["Iodine K-edge"])
+        gadolinium_kedge_col_profile = as_numpy(col_profiles["Gadolinium K-edge"])
+
+        full_maps = {}
+        coarse_maps = {}
+        for name, low_map in low_maps.items():
+            full_maps[name], coarse_maps[name] = fuse_structure_preserving_map(structure_base, low_map, pixel_data)
+    except Exception:
+        raise
     water_full = full_maps["Water"]
     iodine_full = full_maps["Iodine"]
     calcium_full = full_maps["Calcium"]
