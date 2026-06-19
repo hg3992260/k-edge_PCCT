@@ -43,9 +43,12 @@ jobs:
           activate-environment: dmg-build
           auto-activate-base: false
           python-version: "3.11"
-          packages: pip setuptools wheel
           channels: conda-forge
           channel-priority: strict
+
+      - name: Bootstrap Build Environment
+        run: |
+          conda install -y -n dmg-build -c conda-forge python=3.11 pip setuptools wheel
 
       - name: Install OpenJPEG
         run: |
