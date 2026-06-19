@@ -13,6 +13,99 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 
+
+def default_app_root():
+    if getattr(sys, "frozen", False):
+        if hasattr(sys, "_MEIPASS"):
+            return Path(sys._MEIPASS)
+        return Path(sys.executable).resolve().parent
+    return Path(__file__).resolve().parent
+
+
+def resolve_packaged_openjpeg() -> Path | None:
+    candidates = []
+    env_candidates = [
+        os.environ.get("OPENJP2_DLL"),
+        os.environ.get("OPENJPEG_DLL"),
+        os.environ.get("OPENJP2_DYLIB"),
+        os.environ.get("OPENJPEG_DYLIB"),
+        os.environ.get("OPENJP2_PATH"),
+        os.environ.get("OPENJPEG_PATH"),
+    ]
+    for raw in env_candidates:
+        if raw:
+            candidates.append(Path(raw))
+
+    search_roots = [default_app_root(), Path(__file__).resolve().parent, Path.cwd()]
+    if getattr(sys, "frozen", False):
+        exe_dir = Path(sys.executable).resolve().parent
+        contents_dir = exe_dir.parent
+        search_roots.extend(
+            [
+                exe_dir,
+                contents_dir,
+                contents_dir / "Frameworks",
+                contents_dir / "Resources",
+            ]
+        )
+        if hasattr(sys, "_MEIPASS"):
+            search_roots.append(Path(sys._MEIPASS))
+
+    library_names = (
+        "libopenjp2.dylib",
+        "libopenjp2.7.dylib",
+        "libopenjp2.so",
+        "libopenjp2.so.7",
+        "openjp2.dll",
+    )
+    for root in search_roots:
+        if not root.exists():
+            continue
+        for lib_name in library_names:
+            candidates.append(root / lib_name)
+            candidates.append(root / "_internal" / lib_name)
+            candidates.append(root / "lib" / lib_name)
+
+    seen = set()
+    for candidate in candidates:
+        normalized = str(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if candidate.exists() and candidate.is_file():
+            return candidate.resolve()
+    return None
+
+
+def configure_glymur_openjpeg():
+    lib_path = resolve_packaged_openjpeg()
+    if lib_path is None:
+        return
+
+    os.environ.setdefault("OPENJP2_PATH", str(lib_path))
+    os.environ.setdefault("OPENJPEG_PATH", str(lib_path))
+
+    if lib_path.suffix == ".dylib":
+        current = os.environ.get("DYLD_LIBRARY_PATH", "")
+        paths = [str(lib_path.parent)]
+        if current:
+            paths.append(current)
+        os.environ["DYLD_LIBRARY_PATH"] = os.pathsep.join(paths)
+
+    if os.name == "nt":
+        config_path = Path.home() / "glymur" / "glymurrc"
+    else:
+        config_home = Path(os.environ.get("XDG_CONFIG_HOME", str(Path.home() / ".config")))
+        config_path = config_home / "glymur" / "glymurrc"
+
+    try:
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        config_path.write_text(f"[library]\nopenjp2 = {lib_path}\n", encoding="utf-8")
+    except OSError:
+        pass
+
+configure_glymur_openjpeg()
+
 import glymur
 import matplotlib
 import numpy as np
@@ -25,15 +118,6 @@ torch_f = None
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt
-
-
-
-def default_app_root():
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path(__file__).resolve().parent
-
-
 def default_data_dir(root: Path) -> Path:
     preferred = [
         root / "dcm",
