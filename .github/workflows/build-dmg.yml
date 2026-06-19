@@ -84,8 +84,9 @@ jobs:
       - name: Build macOS App
         run: |
           set -euxo pipefail
+          WORKSPACE_DIR="${GITHUB_WORKSPACE:-$PWD}"
           python -m PyInstaller \
-            slice_report_desktop.py \
+            "${WORKSPACE_DIR}/slice_report_desktop.py" \
             --noconfirm \
             --clean \
             --windowed \
@@ -99,7 +100,7 @@ jobs:
             --collect-submodules glymur \
             --collect-submodules matplotlib \
             --collect-data matplotlib \
-            --add-data "reconstructed_weight_maps/logo:reconstructed_weight_maps/logo" \
+            --add-data "${WORKSPACE_DIR}/reconstructed_weight_maps/logo:reconstructed_weight_maps/logo" \
             --add-binary "${OPENJPEG_DYLIB}:."
 
       - name: Build DMG
