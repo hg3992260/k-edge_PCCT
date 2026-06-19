@@ -28,7 +28,7 @@ env:
 
 jobs:
   build-macos:
-    runs-on: macos-13
+    runs-on: macos-latest
     defaults:
       run:
         shell: bash -el {0}
