@@ -75,11 +75,42 @@ jobs:
           for item in candidates:
               if item.exists():
                   with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
-                      fh.write(f"OPENJPEG_DYLIB={item}\n")
+                      fh.write(f"OPENJPEG_SOURCE_DYLIB={item}\n")
                   break
           else:
               raise SystemExit("OpenJPEG dynamic library not found in conda environment")
           PY
+
+      - name: Stage OpenJPEG Runtime
+        run: |
+          set -euxo pipefail
+          WORKSPACE_DIR="${GITHUB_WORKSPACE:-$PWD}"
+          mkdir -p "${WORKSPACE_DIR}/build"
+          cp -L "${OPENJPEG_SOURCE_DYLIB}" "${WORKSPACE_DIR}/build/libopenjp2.dylib"
+          echo "OPENJPEG_DYLIB=${WORKSPACE_DIR}/build/libopenjp2.dylib" >> "${GITHUB_ENV}"
+
+      - name: Build macOS Icon
+        run: |
+          set -euxo pipefail
+          WORKSPACE_DIR="${GITHUB_WORKSPACE:-$PWD}"
+          ICON_SOURCE="$(find "${WORKSPACE_DIR}/reconstructed_weight_maps/logo" -maxdepth 1 -type f \( -iname '*.png' -o -iname '*.jpg' -o -iname '*.jpeg' -o -iname '*.bmp' \) | head -n 1)"
+          test -n "${ICON_SOURCE}"
+          ICONSET_DIR="${WORKSPACE_DIR}/build/app.iconset"
+          ICON_PATH="${WORKSPACE_DIR}/build/app_icon.icns"
+          rm -rf "${ICONSET_DIR}"
+          mkdir -p "${ICONSET_DIR}"
+          sips -s format png -z 16 16 "${ICON_SOURCE}" --out "${ICONSET_DIR}/icon_16x16.png"
+          sips -s format png -z 32 32 "${ICON_SOURCE}" --out "${ICONSET_DIR}/icon_16x16@2x.png"
+          sips -s format png -z 32 32 "${ICON_SOURCE}" --out "${ICONSET_DIR}/icon_32x32.png"
+          sips -s format png -z 64 64 "${ICON_SOURCE}" --out "${ICONSET_DIR}/icon_32x32@2x.png"
+          sips -s format png -z 128 128 "${ICON_SOURCE}" --out "${ICONSET_DIR}/icon_128x128.png"
+          sips -s format png -z 256 256 "${ICON_SOURCE}" --out "${ICONSET_DIR}/icon_128x128@2x.png"
+          sips -s format png -z 256 256 "${ICON_SOURCE}" --out "${ICONSET_DIR}/icon_256x256.png"
+          sips -s format png -z 512 512 "${ICON_SOURCE}" --out "${ICONSET_DIR}/icon_256x256@2x.png"
+          sips -s format png -z 512 512 "${ICON_SOURCE}" --out "${ICONSET_DIR}/icon_512x512.png"
+          sips -s format png -z 1024 1024 "${ICON_SOURCE}" --out "${ICONSET_DIR}/icon_512x512@2x.png"
+          iconutil -c icns "${ICONSET_DIR}" -o "${ICON_PATH}"
+          echo "APP_ICON_ICNS=${ICON_PATH}" >> "${GITHUB_ENV}"
 
       - name: Build macOS App
         run: |
@@ -91,6 +122,7 @@ jobs:
             --clean \
             --windowed \
             --name "${APP_NAME}" \
+            --icon "${APP_ICON_ICNS}" \
             --distpath dist \
             --workpath build \
             --specpath build \
