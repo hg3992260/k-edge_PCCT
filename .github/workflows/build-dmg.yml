@@ -112,6 +112,44 @@ jobs:
           iconutil -c icns "${ICONSET_DIR}" -o "${ICON_PATH}"
           echo "APP_ICON_ICNS=${ICON_PATH}" >> "${GITHUB_ENV}"
 
+      - name: Build Glymur Runtime Hook
+        run: |
+          set -euxo pipefail
+          WORKSPACE_DIR="${GITHUB_WORKSPACE:-$PWD}"
+          HOOK_PATH="${WORKSPACE_DIR}/build/runtime_hook_glymur.py"
+          cat > "${HOOK_PATH}" <<'PY'
+          import os
+          import sys
+          from pathlib import Path
+
+          if sys.platform == "darwin":
+              bundle_root = Path(getattr(sys, "_MEIPASS", Path(sys.executable).resolve().parent))
+              exe_dir = Path(sys.executable).resolve().parent
+              candidates = [
+                  bundle_root / "libopenjp2.dylib",
+                  bundle_root / "libopenjp2.7.dylib",
+                  bundle_root / "_internal" / "libopenjp2.dylib",
+                  bundle_root / "_internal" / "libopenjp2.7.dylib",
+                  exe_dir / "libopenjp2.dylib",
+                  exe_dir / "libopenjp2.7.dylib",
+                  exe_dir.parent / "Frameworks" / "libopenjp2.dylib",
+                  exe_dir.parent / "Frameworks" / "libopenjp2.7.dylib",
+              ]
+              lib_path = next((item.resolve() for item in candidates if item.exists()), None)
+              if lib_path is not None:
+                  runtime_root = Path.home() / "Library" / "Application Support" / "KEdgeSliceReport" / "runtime-config"
+                  config_dir = runtime_root / "glymur"
+                  config_dir.mkdir(parents=True, exist_ok=True)
+                  (config_dir / "glymurrc").write_text(
+                      f"[library]\nopenjp2: {lib_path}\n",
+                      encoding="utf-8",
+                  )
+                  os.environ["XDG_CONFIG_HOME"] = str(runtime_root)
+                  current = os.environ.get("DYLD_LIBRARY_PATH", "")
+                  os.environ["DYLD_LIBRARY_PATH"] = str(lib_path.parent) if not current else f"{lib_path.parent}{os.pathsep}{current}"
+          PY
+          echo "GLYMUR_RUNTIME_HOOK=${HOOK_PATH}" >> "${GITHUB_ENV}"
+
       - name: Build macOS App
         run: |
           set -euxo pipefail
@@ -123,6 +161,7 @@ jobs:
             --windowed \
             --name "${APP_NAME}" \
             --icon "${APP_ICON_ICNS}" \
+            --runtime-hook "${GLYMUR_RUNTIME_HOOK}" \
             --distpath dist \
             --workpath build \
             --specpath build \
