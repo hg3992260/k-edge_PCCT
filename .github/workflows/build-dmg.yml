@@ -21,6 +21,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
+  APP_NAME: KEdgeSliceReport
   PYTHONUTF8: "1"
   PIP_DISABLE_PIP_VERSION_CHECK: "1"
   KMP_DUPLICATE_LIB_OK: "TRUE"
@@ -46,76 +47,46 @@ jobs:
           channels: conda-forge
           channel-priority: strict
 
-      - name: Ensure Pip In Conda Env
-        run: |
-          conda install -y pip setuptools wheel
-          python -m ensurepip --upgrade || true
-
       - name: Install OpenJPEG
         run: |
           conda install -y -c conda-forge openjpeg
 
       - name: Install Python Dependencies
         run: |
-          which python
           python --version
           python -m pip --version
           python -m pip install --upgrade pip
           python -m pip install -r requirements-desktop-build.txt
 
-      - name: Show Build Environment
+      - name: Resolve OpenJPEG Path
         run: |
-          python --version
-          python -m pip --version
-          conda info
-          conda list | grep -E "openjpeg|pyqt|pyinstaller|glymur|pydicom|numpy|scipy|matplotlib|pillow" || true
           python - <<'PY'
           import os
           from pathlib import Path
-          candidates = []
-          conda_prefix = os.environ.get("CONDA_PREFIX")
-          if conda_prefix:
-              candidates.extend(
-                  [
-                      Path(conda_prefix) / "lib" / "libopenjp2.dylib",
-                      Path(conda_prefix) / "lib" / "libopenjp2.7.dylib",
-                  ]
-              )
+
+          conda_prefix = os.environ.get("CONDA_PREFIX", "")
+          candidates = [
+              Path(conda_prefix) / "lib" / "libopenjp2.dylib",
+              Path(conda_prefix) / "lib" / "libopenjp2.7.dylib",
+          ]
           for item in candidates:
-              print(f"CHECK_OPENJP2 {item} exists={item.exists()}")
+              if item.exists():
+                  with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+                      fh.write(f"OPENJPEG_DYLIB={item}\n")
+                  break
+          else:
+              raise SystemExit("OpenJPEG dynamic library not found in conda environment")
           PY
 
       - name: Build macOS App
         run: |
           set -euxo pipefail
-          OPENJPEG_DYLIB="$(python - <<'PY'
-          import os
-          from pathlib import Path
-          candidates = []
-          conda_prefix = os.environ.get("CONDA_PREFIX")
-          if conda_prefix:
-              candidates.extend(
-                  [
-                      Path(conda_prefix) / "lib" / "libopenjp2.dylib",
-                      Path(conda_prefix) / "lib" / "libopenjp2.7.dylib",
-                  ]
-              )
-          for item in candidates:
-              if item.exists():
-                  print(item)
-                  break
-          PY
-          )"
-          if [ -z "${OPENJPEG_DYLIB}" ]; then
-            echo "OpenJPEG dynamic library not found"
-            exit 1
-          fi
           python -m PyInstaller \
             slice_report_desktop.py \
             --noconfirm \
             --clean \
             --windowed \
-            --name KEdgeSliceReport \
+            --name "${APP_NAME}" \
             --distpath dist \
             --workpath build \
             --specpath build \
@@ -132,18 +103,19 @@ jobs:
         run: |
           set -euxo pipefail
           mkdir -p release/dmg-root
-          cp -R "dist/KEdgeSliceReport.app" "release/dmg-root/"
+          cp -R "dist/${APP_NAME}.app" "release/dmg-root/"
+          ln -s /Applications "release/dmg-root/Applications"
           hdiutil create \
-            -volname "KEdgeSliceReport" \
+            -volname "${APP_NAME}" \
             -srcfolder "release/dmg-root" \
             -ov \
             -format UDZO \
-            "release/KEdgeSliceReport-macos.dmg"
+            "release/${APP_NAME}-macos.dmg"
 
       - name: Verify Build Outputs
         run: |
-          test -d dist/KEdgeSliceReport.app
-          test -f release/KEdgeSliceReport-macos.dmg
+          test -d "dist/${APP_NAME}.app"
+          test -f "release/${APP_NAME}-macos.dmg"
           ls -lah dist
           ls -lah release
 
