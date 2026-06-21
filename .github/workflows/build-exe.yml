@@ -13,25 +13,12 @@ on:
       - "scripts/build_windows_exe.py"
       - ".github/workflows/build-exe.yml"
       - "reconstructed_weight_maps/logo/**"
-
-permissions:
-  contents: read
-
-concurrency:
-  group: build-windows-exe-${{ github.ref }}
-  cancel-in-progress: true
-
-env:
-  PYTHONUTF8: "1"
-  PIP_DISABLE_PIP_VERSION_CHECK: "1"
-  KMP_DUPLICATE_LIB_OK: "TRUE"
+      - "kedge_app/**"
+      - "pure_c_kedge/**"
 
 jobs:
   build-windows:
     runs-on: windows-latest
-    defaults:
-      run:
-        shell: bash -el {0}
 
     steps:
       - name: Checkout
@@ -43,72 +30,31 @@ jobs:
           activate-environment: exe-build
           auto-activate-base: false
           python-version: "3.11"
-          packages: pip setuptools wheel
-          channels: conda-forge
-          channel-priority: strict
-
-      - name: Ensure Pip In Conda Env
-        run: |
-          conda install -y pip setuptools wheel
-          python -m ensurepip --upgrade || true
 
       - name: Install OpenJPEG
+        shell: bash -el {0}
         run: |
           conda install -y -c conda-forge openjpeg
 
       - name: Install Python Dependencies
+        shell: bash -el {0}
         run: |
-          where python || true
-          python --version
-          python -m pip --version
           python -m pip install --upgrade pip
           python -m pip install -r requirements-desktop-build.txt
 
-      - name: Show Build Environment
-        run: |
-          python --version
-          python -m pip --version
-          conda info
-          conda list | grep -E "openjpeg|pyqt|pyinstaller|glymur|pydicom|numpy|scipy|matplotlib|pillow" || true
-          python - <<'PY'
-          import os
-          from pathlib import Path
-          candidates = []
-          conda_prefix = os.environ.get("CONDA_PREFIX")
-          if conda_prefix:
-              candidates.extend(
-                  [
-                      Path(conda_prefix) / "Library" / "bin" / "openjp2.dll",
-                      Path(conda_prefix) / "bin" / "openjp2.dll",
-                  ]
-              )
-          for item in candidates:
-              print(f"CHECK_OPENJP2 {item} exists={item.exists()}")
-          PY
-
       - name: Build EXE
+        shell: bash -el {0}
         run: |
           python scripts/build_windows_exe.py
-
-      - name: Verify Build Outputs
-        run: |
-          test -f dist/KEdgeSliceReport.exe
-          test -f release/KEdgeSliceReport-windows.zip
-          ls -lah dist
-          ls -lah release
 
       - name: Upload EXE
         uses: actions/upload-artifact@v4
         with:
           name: KEdgeSliceReport-windows-exe
           path: dist/KEdgeSliceReport.exe
-          if-no-files-found: error
-          retention-days: 14
 
       - name: Upload EXE Zip
         uses: actions/upload-artifact@v4
         with:
           name: KEdgeSliceReport-windows-zip
           path: release/KEdgeSliceReport-windows.zip
-          if-no-files-found: error
-          retention-days: 14
