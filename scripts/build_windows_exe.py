@@ -111,8 +111,10 @@ def build():
         "matplotlib",
         "--add-data",
         add_data_arg(LOGO_DIR, "reconstructed_weight_maps/logo"),
+        "--add-data",
+        add_data_arg(PROJECT_ROOT / "pure_c_kedge", "pure_c_kedge"),
         "--add-binary",
-        add_data_arg(openjp2_dll, "."),
+        add_data_arg(openjp2_dll, "pure_c_kedge"),
     ]
     PyInstaller.__main__.run(args)
 

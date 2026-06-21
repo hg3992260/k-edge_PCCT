@@ -2,9 +2,12 @@ import base64
 import copy
 import io
 import json
+import math
 import os
 import re
 import shutil
+import struct
+import subprocess
 import sys
 import threading
 import time
@@ -134,8 +137,10 @@ ROOT = Path(os.environ.get("KEDGE_APP_ROOT", str(default_app_root())))
 DATA_DIR = Path(os.environ.get("KEDGE_DATA_DIR", str(default_data_dir(ROOT))))
 OUT_DIR = Path(os.environ.get("KEDGE_OUT_DIR", str(ROOT / "reconstructed_weight_maps")))
 CACHE_DIR = Path(os.environ.get("KEDGE_CACHE_DIR", str(ROOT / "_pcct_cache")))
+C_BACKEND_NAME = "Pure C / OpenJPEG"
+C_BACKEND_CUDA_NAME = "Pure C / CUDA (nvJPEG2000 Ready)"
 REPORT_INTERACTION_VERSION = 2
-REPORT_CONTENT_VERSION = 8
+REPORT_CONTENT_VERSION = 9
 KEDGE_MODEL_VERSION = 1
 
 
@@ -290,6 +295,72 @@ def backend_zoom(x, zoom_factors, order=1):
     return cpu_zoom(np.asarray(x), zoom_factors, order=order)
 
 
+def upsample_rows_linear_exact(x, factor=8):
+    if torch is not None and isinstance(x, torch.Tensor):
+        src = x.to(dtype=torch.float64)
+        if src.ndim != 2:
+            raise ValueError(f"upsample_rows_linear_exact expects 2D input, got {tuple(src.shape)}")
+        rows, cols = map(int, src.shape)
+        out = torch.empty((rows * factor, cols), dtype=torch.float64, device=src.device)
+        for y in range(rows * factor):
+            src_y = float(y) / float(factor)
+            y0 = int(math.floor(src_y))
+            y1 = y0 + 1
+            t = src_y - float(y0)
+            y0 = min(max(y0, 0), rows - 1)
+            y1 = min(max(y1, 0), rows - 1)
+            out[y] = src[y0] * (1.0 - t) + src[y1] * t
+        return out
+    src = np.asarray(x, dtype=np.float64)
+    if src.ndim != 2:
+        raise ValueError(f"upsample_rows_linear_exact expects 2D input, got {src.shape}")
+    rows, cols = src.shape
+    out = np.empty((rows * factor, cols), dtype=np.float64)
+    for y in range(rows * factor):
+        src_y = float(y) / float(factor)
+        y0 = int(math.floor(src_y))
+        y1 = y0 + 1
+        t = src_y - float(y0)
+        y0 = min(max(y0, 0), rows - 1)
+        y1 = min(max(y1, 0), rows - 1)
+        out[y] = src[y0] * (1.0 - t) + src[y1] * t
+    return out
+
+
+def gradient_magnitude_lowres_exact(x):
+    if torch is not None and isinstance(x, torch.Tensor):
+        src = x.to(dtype=torch.float64)
+        if src.ndim != 2:
+            raise ValueError(f"gradient_magnitude_lowres_exact expects 2D input, got {tuple(src.shape)}")
+        rows, cols = map(int, src.shape)
+        out = torch.empty_like(src, dtype=torch.float64)
+        for y in range(rows):
+            y0 = y - 1 if y > 0 else y
+            y1 = y + 1 if y + 1 < rows else y
+            for x_idx in range(cols):
+                x0 = x_idx - 1 if x_idx > 0 else x_idx
+                x1 = x_idx + 1 if x_idx + 1 < cols else x_idx
+                gy = 0.5 * (src[y1, x_idx] - src[y0, x_idx])
+                gx = 0.5 * (src[y, x1] - src[y, x0])
+                out[y, x_idx] = torch.sqrt(gx * gx + gy * gy)
+        return out
+    src = np.asarray(x, dtype=np.float64)
+    if src.ndim != 2:
+        raise ValueError(f"gradient_magnitude_lowres_exact expects 2D input, got {src.shape}")
+    rows, cols = src.shape
+    out = np.empty_like(src, dtype=np.float64)
+    for y in range(rows):
+        y0 = y - 1 if y > 0 else y
+        y1 = y + 1 if y + 1 < rows else y
+        for x_idx in range(cols):
+            x0 = x_idx - 1 if x_idx > 0 else x_idx
+            x1 = x_idx + 1 if x_idx + 1 < cols else x_idx
+            gy = 0.5 * (src[y1, x_idx] - src[y0, x_idx])
+            gx = 0.5 * (src[y, x1] - src[y, x0])
+            out[y, x_idx] = math.sqrt(gx * gx + gy * gy)
+    return out
+
+
 def percentile_scalar(x, q):
     if torch is not None and isinstance(x, torch.Tensor):
         flat = x.reshape(-1)
@@ -389,6 +460,14 @@ def array_to_png_b64(x, lo, hi, cmap="gray"):
         norm = np.zeros_like(arr, dtype=np.float64)
     else:
         norm = np.clip((arr - lo) / (hi - lo), 0.0, 1.0)
+    
+    if cmap == "gray":
+        import PIL.Image
+        img = PIL.Image.fromarray((norm * 255.0).astype(np.uint8), mode="L")
+        buf = io.BytesIO()
+        img.save(buf, format="PNG")
+        return base64.b64encode(buf.getvalue()).decode("ascii")
+    
     buf = io.BytesIO()
     plt.imsave(buf, norm, cmap=cmap, format="png", vmin=0.0, vmax=1.0)
     buf.seek(0)
@@ -471,8 +550,8 @@ def percentile_range_in_mask(x, mask=None, lo=1, hi=99, fallback=None):
     valid = valid[np.isfinite(valid)]
     if valid.size == 0:
         return fallback if fallback is not None else (-1.0, 1.0)
-    lo_v = float(np.percentile(valid, lo))
-    hi_v = float(np.percentile(valid, hi))
+    lo_v, hi_v = np.percentile(valid, [lo, hi])
+    lo_v, hi_v = float(lo_v), float(hi_v)
     if hi_v - lo_v < 1e-6:
         center = float(np.median(valid))
         span = max(float(np.std(valid)), 1e-3)
@@ -537,16 +616,474 @@ def build_material_interactive_payload(
     }
 
 
-def write_native_report(payload):
-    out_json = OUT_DIR / "iodine_kedge_report_native.json"
+def write_native_report(payload, out_dir=None):
+    out_dir = out_dir if out_dir is not None else OUT_DIR
+    out_json = out_dir / "iodine_kedge_report_native.json"
     out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return out_json
 
 
-def write_generation_meta(payload):
-    out_json = OUT_DIR / "report_generation_meta.json"
+def write_generation_meta(payload, out_dir=None):
+    out_dir = out_dir if out_dir is not None else OUT_DIR
+    out_json = out_dir / "report_generation_meta.json"
     out_json.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     return out_json
+
+
+def resolve_c_backend_exe() -> Path | None:
+    prefer_cpu_only = str(os.environ.get("KEDGE_PREFER_CPU_C_BACKEND", "") or "").strip().lower() in {
+        "1",
+        "true",
+        "yes",
+    }
+    exe_names = ["pure_c_kedge.exe"] if prefer_cpu_only else ["pure_c_kedge_cuda.exe", "pure_c_kedge.exe"]
+    candidate_roots = [
+        ROOT / "pure_c_kedge",
+        default_app_root() / "pure_c_kedge",
+        Path(__file__).resolve().parent / "pure_c_kedge",
+    ]
+    candidates = []
+    for root in candidate_roots:
+        for exe_name in exe_names:
+            candidates.append(root / exe_name)
+    seen = set()
+    for candidate in candidates:
+        normalized = str(candidate.resolve()) if candidate.exists() else str(candidate)
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        if candidate.exists() and candidate.is_file():
+            dll_path = candidate.parent / "openjp2.dll"
+            if dll_path.exists() and dll_path.is_file():
+                return candidate.resolve()
+    return None
+
+
+def detect_c_backend_available() -> tuple[bool, str]:
+    exe_path = resolve_c_backend_exe()
+    if exe_path is None:
+        return False, "未检测到 pure_c_kedge(.exe/.cuda.exe) 或 openjp2.dll，当前回退 Python / NumPy"
+    backend_kind = C_BACKEND_CUDA_NAME if "cuda" in exe_path.stem.lower() else C_BACKEND_NAME
+    return True, f"已检测到 {backend_kind} 后端: {exe_path.name}"
+
+
+def resolved_c_backend_name() -> str:
+    backend_pref = os.environ.get("KEDGE_BACKEND", "").lower()
+    if backend_pref == "cuda-full":
+        return "Pure C / nvJPEG2000 + CUDA"
+    exe_path = resolve_c_backend_exe()
+    if exe_path is not None and "cuda" in exe_path.stem.lower():
+        if backend_pref == "cpu":
+            return C_BACKEND_NAME
+        return C_BACKEND_CUDA_NAME
+    return C_BACKEND_NAME
+
+
+def single_slice_output_dir(source_path, output_root=None):
+    target_root = Path(output_root) if output_root is not None else ROOT / "ui_slice_reports"
+    case_name = source_path.parent.name or "case"
+    return target_root / case_name / source_path.stem
+
+
+def build_c_backend_command(source_path: Path, output_dir: Path) -> list[str]:
+    exe_path = resolve_c_backend_exe()
+    if exe_path is None:
+        raise RuntimeError("未检测到 pure_c_kedge.exe 或 openjp2.dll，无法启用 C 后端。")
+    cmd = [str(exe_path), str(source_path), str(output_dir)]
+    backend_pref = os.environ.get("KEDGE_BACKEND")
+    if backend_pref:
+        cmd.extend(["--backend", backend_pref])
+    return cmd
+
+
+def build_exported_dcm_map_from_output_dir(output_dir: Path) -> dict:
+    exported = {}
+    for spec in MATERIAL_OUTPUT_SPECS + KEDGE_OUTPUT_SPECS:
+        dcm_path = output_dir / f"{spec['key']}_weight_map.dcm"
+        if not dcm_path.exists():
+            raise RuntimeError(f"C 后端缺少导出 DICOM: {dcm_path.name}")
+        exported[spec["key"]] = dcm_path
+    return exported
+
+
+def read_c_backend_band_stack(output_dir: Path):
+    band_path = output_dir / "band_stack_float32.bin"
+    if not band_path.exists():
+        return None
+    with band_path.open("rb") as fh:
+        header = fh.read(20)
+        if len(header) != 20:
+            raise RuntimeError(f"C 后端 8-bin 数据头长度无效: {band_path.name}")
+        magic, version, band_count, rows, cols = struct.unpack("<4sIIII", header)
+        if magic != b"KBND":
+            raise RuntimeError(f"C 后端 8-bin 数据 magic 无效: {band_path.name}")
+        if version != 1:
+            raise RuntimeError(f"C 后端 8-bin 数据版本不支持: v{version}")
+        if band_count != 8 or rows <= 0 or cols <= 0:
+            raise RuntimeError(f"C 后端 8-bin 数据维度无效: bands={band_count}, rows={rows}, cols={cols}")
+        data = np.fromfile(fh, dtype="<f4")
+    expected = int(band_count) * int(rows) * int(cols)
+    if data.size != expected:
+        raise RuntimeError(
+            f"C 后端 8-bin 数据大小不匹配: expected={expected}, actual={data.size}, file={band_path.name}"
+        )
+    return data.reshape((band_count, rows, cols))
+
+
+def build_single_slice_native_report_from_exports(
+    source_path: Path,
+    target_out_dir: Path,
+    exported_dcms: dict,
+    backend_name: str,
+    fast_mode: bool,
+    defer_static_figures: bool,
+):
+    ds = pydicom.dcmread(str(source_path), force=True)
+    if (0xEFE1, 0x1001) not in ds:
+        raise RuntimeError(f"切片缺少私有标签 (EFE1,1001): {source_path.name}")
+
+    pixel_data = read_pixel_array(ds)
+    window_center, window_width = dicom_window_defaults(ds)
+    blob = ds[0xEFE1, 0x1001].value
+    curves, _ = parse_curves(blob)
+    bin_curve_matrix = compute_bin_curve_matrix(curves)
+    material_weights, iodine_kedge_weights, gadolinium_kedge_weights = build_material_weight_vectors(bin_curve_matrix)
+    iodine_weights = material_weights["Iodine"]
+    band_stack = read_c_backend_band_stack(target_out_dir)
+
+    material_full_maps = {}
+    for spec in MATERIAL_OUTPUT_SPECS + KEDGE_OUTPUT_SPECS:
+        derived_ds = pydicom.dcmread(str(exported_dcms[spec["key"]]), force=True)
+        material_full_maps[spec["name"]] = read_pixel_array(derived_ds)
+
+    p50, p65, p80, p98_5, p99_5 = np.percentile(pixel_data, [50, 65, 80, 98.5, 99.5])
+    body_mask = pixel_data > p50
+    high_mask = pixel_data > p99_5
+    if np.count_nonzero(high_mask) < 100:
+        high_mask = pixel_data > p98_5
+    soft_mask = body_mask & (pixel_data > p65) & (pixel_data < p80)
+    pixel_masks = (body_mask, high_mask, soft_mask)
+
+    material_metrics = {name: map_metrics(map_full, pixel_data, pixel_masks=pixel_masks) for name, map_full in material_full_maps.items()}
+    iodine_metrics = material_metrics["Iodine"]
+    kedge_metrics = material_metrics["Iodine K-edge"]
+    gadolinium_kedge_metrics = material_metrics["Gadolinium K-edge"]
+
+    overview_img = None
+    material_gallery_img = None
+    difference_img = None
+    weights_img = None
+    band_img = None
+    scatter_img = None
+    figure_start = time.perf_counter()
+    if not defer_static_figures:
+        overview_img = build_overview_figure(
+            pixel_data,
+            pixel_data,
+            material_full_maps["Iodine"],
+            material_full_maps["Iodine K-edge"],
+        )
+        material_gallery_img = build_material_gallery_figure(pixel_data, material_full_maps)
+        difference_img = build_difference_figure(
+            pixel_data,
+            material_full_maps["Iodine"],
+            material_full_maps["Iodine K-edge"],
+        )
+        weights_img = build_weights_figure(
+            bin_curve_matrix,
+            material_weights,
+            iodine_kedge_weights,
+            gadolinium_kedge_weights,
+        )
+        if band_stack is not None:
+            band_img = build_band_figure(
+                band_stack,
+                material_weights,
+                iodine_kedge_weights,
+                gadolinium_kedge_weights,
+            )
+        scatter_img = build_scatter_figure(
+            pixel_data,
+            material_full_maps["Iodine"],
+            material_full_maps["Iodine K-edge"],
+        )
+    build_figures_s = time.perf_counter() - figure_start
+
+    assets_dir = target_out_dir / "native_assets" / "iodine_report"
+    overview_png = assets_dir / "overview.png"
+    materials_png = assets_dir / "materials.png"
+    difference_png = assets_dir / "difference.png"
+    weights_png = assets_dir / "weights.png"
+    bands_png = assets_dir / "bands.png"
+    scatter_png = assets_dir / "scatter.png"
+    asset_start = time.perf_counter()
+    if not fast_mode and not defer_static_figures:
+        b64_to_png_file(overview_img, overview_png)
+        b64_to_png_file(material_gallery_img, materials_png)
+        b64_to_png_file(difference_img, difference_png)
+        b64_to_png_file(weights_img, weights_png)
+        if band_img:
+            b64_to_png_file(band_img, bands_png)
+        b64_to_png_file(scatter_img, scatter_png)
+    write_assets_s = time.perf_counter() - asset_start
+
+    json_start = time.perf_counter()
+    material_interactive = build_material_interactive_payload(
+        pixel_data,
+        material_full_maps,
+        window_center=window_center,
+        window_width=window_width,
+    )
+    native_json = write_native_report(
+        build_single_slice_native_report_payload(
+            source_path=source_path,
+            backend_name=backend_name,
+            recon_mode=RECON_MODE,
+            overview_img=overview_img,
+            material_gallery_img=material_gallery_img,
+            difference_img=difference_img,
+            weights_img=weights_img,
+            band_img=band_img,
+            scatter_img=scatter_img,
+            water_dcm_path=str(exported_dcms["water"]),
+            iodine_dcm_path=str(exported_dcms["iodine"]),
+            calcium_dcm_path=str(exported_dcms["calcium"]),
+            gadolinium_dcm_path=str(exported_dcms["gadolinium"]),
+            kedge_dcm_path=str(exported_dcms["kedge"]),
+            gadolinium_kedge_dcm_path=str(exported_dcms["gadolinium_kedge"]),
+            material_metrics=material_metrics,
+            iodine_metrics=iodine_metrics,
+            kedge_metrics=kedge_metrics,
+            gadolinium_kedge_metrics=gadolinium_kedge_metrics,
+            material_weights=material_weights,
+            iodine_weights=iodine_weights,
+            kedge_weights=iodine_kedge_weights,
+            gadolinium_kedge_weights=gadolinium_kedge_weights,
+            material_interactive=material_interactive,
+        ),
+        out_dir=target_out_dir,
+    )
+    write_native_json_s = time.perf_counter() - json_start
+    return {
+        "native_json": native_json,
+        "window_center": float(window_center),
+        "window_width": float(window_width),
+        "build_figures_s": build_figures_s,
+        "write_assets_s": write_assets_s,
+        "write_native_json_s": write_native_json_s,
+    }
+
+
+def write_generation_meta_for_c_backend(
+    source_path: Path,
+    fast_mode: bool,
+    defer_static_figures: bool,
+    exported_dcms: dict,
+    stage_timings: dict,
+    window_center: float,
+    window_width: float,
+    out_dir: Path = None,
+):
+    return write_generation_meta(
+        {
+            "source_path": str(source_path),
+            "fast_mode": bool(fast_mode),
+            "defer_static_figures": bool(defer_static_figures),
+            "backend_name": C_BACKEND_NAME,
+            "report_interaction_version": int(REPORT_INTERACTION_VERSION),
+            "report_content_version": int(REPORT_CONTENT_VERSION),
+            "kedge_model_version": int(KEDGE_MODEL_VERSION),
+            "recon_mode": RECON_MODE,
+            "window_center": float(window_center),
+            "window_width": float(window_width),
+            "dcm_exports_ready": all(path is not None and Path(path).exists() for path in exported_dcms.values()),
+            "stage_timings": {key: float(value) for key, value in stage_timings.items()},
+        },
+        out_dir=out_dir,
+    )
+
+
+def refresh_single_slice_static_figures(file_path, output_root=None):
+    source_path = Path(file_path)
+    if not source_path.exists():
+        raise FileNotFoundError(f"切片不存在: {source_path}")
+
+    target_out_dir = single_slice_output_dir(source_path, output_root=output_root)
+    if not target_out_dir.exists():
+        raise RuntimeError(f"当前层还没有可复用的输出目录: {target_out_dir}")
+
+    try:
+        total_start = time.perf_counter()
+        exported_dcms = build_exported_dcm_map_from_output_dir(target_out_dir)
+
+        meta_path = target_out_dir / "report_generation_meta.json"
+        existing_meta = {}
+        if meta_path.exists():
+            try:
+                existing_meta = json.loads(meta_path.read_text(encoding="utf-8"))
+            except Exception:
+                existing_meta = {}
+
+        backend_name = str(existing_meta.get("backend_name") or resolved_c_backend_name())
+        fast_mode = bool(existing_meta.get("fast_mode", False))
+        rebuild = build_single_slice_native_report_from_exports(
+            source_path=source_path,
+            target_out_dir=target_out_dir,
+            exported_dcms=exported_dcms,
+            backend_name=backend_name,
+            fast_mode=fast_mode,
+            defer_static_figures=False,
+        )
+
+        old_stage_timings = existing_meta.get("stage_timings", {}) if isinstance(existing_meta, dict) else {}
+        stage_timings = {
+            "read_dicom_s": float(old_stage_timings.get("read_dicom_s", 0.0)),
+            "compute_products_s": float(old_stage_timings.get("compute_products_s", 0.0)),
+            "export_dicom_s": float(old_stage_timings.get("export_dicom_s", 0.0)),
+            "build_figures_s": float(rebuild["build_figures_s"]),
+            "write_assets_s": float(rebuild["write_assets_s"]),
+            "write_native_json_s": float(rebuild["write_native_json_s"]),
+        }
+        stage_timings["total_s"] = sum(stage_timings.values())
+        generation_meta = write_generation_meta(
+            {
+                "source_path": str(source_path),
+                "fast_mode": fast_mode,
+                "defer_static_figures": False,
+                "backend_name": backend_name,
+                "report_interaction_version": int(REPORT_INTERACTION_VERSION),
+                "report_content_version": int(REPORT_CONTENT_VERSION),
+                "kedge_model_version": int(KEDGE_MODEL_VERSION),
+                "recon_mode": RECON_MODE,
+                "window_center": float(rebuild["window_center"]),
+                "window_width": float(rebuild["window_width"]),
+                "dcm_exports_ready": all(path is not None and Path(path).exists() for path in exported_dcms.values()),
+                "stage_timings": {key: float(value) for key, value in stage_timings.items()},
+                "refresh_static_figures_only_s": float(time.perf_counter() - total_start),
+            },
+            out_dir=target_out_dir,
+        )
+        return {
+            "source_path": source_path,
+            "output_dir": target_out_dir,
+            "native_json": rebuild["native_json"],
+            "exported_dcm_paths": exported_dcms,
+            "fast_mode": fast_mode,
+            "defer_static_figures": False,
+            "report_interaction_version": int(REPORT_INTERACTION_VERSION),
+            "report_content_version": int(REPORT_CONTENT_VERSION),
+            "kedge_model_version": int(KEDGE_MODEL_VERSION),
+            "window_center": float(rebuild["window_center"]),
+            "window_width": float(rebuild["window_width"]),
+            "stage_timings": stage_timings,
+            "generation_meta": generation_meta,
+            "backend_name": backend_name,
+            "backend_fallback_used": False,
+            "backend_requested": str(existing_meta.get("backend_requested") or "cached"),
+            "action": "refresh_static_figures",
+        }
+    except Exception:
+        raise
+
+
+def run_c_backend_single_slice(file_path, output_root=None, fast_mode=False, defer_static_figures=False):
+    source_path = Path(file_path)
+    if not source_path.exists():
+        raise FileNotFoundError(f"切片不存在: {source_path}")
+
+    target_out_dir = single_slice_output_dir(source_path, output_root=output_root)
+    target_out_dir.parent.mkdir(parents=True, exist_ok=True)
+    CACHE_DIR.mkdir(exist_ok=True)
+    temp_root = target_out_dir.parent / f"__c_backend_tmp__{source_path.stem}"
+    if temp_root.exists():
+        shutil.rmtree(temp_root)
+    temp_root.mkdir(parents=True, exist_ok=True)
+
+    try:
+        total_start = time.perf_counter()
+        backend_name = resolved_c_backend_name()
+        cmd = build_c_backend_command(source_path, temp_root)
+        exe_path = resolve_c_backend_exe()
+        env = os.environ.copy()
+        env.setdefault("KEDGE_OPENJPEG_THREADS", "2")
+        # Default C+CUDA runs the numerically aligned fast path unless the caller explicitly overrides it.
+        if exe_path is not None and "cuda" in exe_path.stem.lower():
+            env.setdefault("KEDGE_CUDA_NUMERIC_MODE", "fast")
+        # Stage dump was introduced for numeric debugging and can drastically slow normal desktop runs.
+        if str(env.get("KEDGE_KEEP_STAGE_DUMP", "") or "").strip().lower() not in {"1", "true", "yes"}:
+            env.pop("KEDGE_STAGE_DUMP_ROOT", None)
+            env.pop("KEDGE_STAGE_DUMP_LABEL", None)
+        stage_start = time.perf_counter()
+        completed = subprocess.run(
+            cmd,
+            cwd=str(exe_path.parent if exe_path is not None else temp_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        compute_products_s = time.perf_counter() - stage_start
+        if completed.returncode != 0:
+            stderr_tail = (completed.stderr or completed.stdout or "").strip()
+            raise RuntimeError(f"C 后端执行失败: {stderr_tail[-2000:]}")
+
+        generated_dir = temp_root / source_path.name
+        if not generated_dir.exists():
+            raise RuntimeError(f"C 后端未生成预期输出目录: {generated_dir}")
+        if target_out_dir.exists():
+            shutil.rmtree(target_out_dir)
+        shutil.move(str(generated_dir), str(target_out_dir))
+
+        exported_dcms = build_exported_dcm_map_from_output_dir(target_out_dir)
+        rebuild = build_single_slice_native_report_from_exports(
+            source_path=source_path,
+            target_out_dir=target_out_dir,
+            exported_dcms=exported_dcms,
+            backend_name=backend_name,
+            fast_mode=bool(fast_mode),
+            defer_static_figures=bool(defer_static_figures),
+        )
+        stage_timings = {
+            "read_dicom_s": 0.0,
+            "compute_products_s": float(compute_products_s),
+            "export_dicom_s": 0.0,
+            "build_figures_s": float(rebuild["build_figures_s"]),
+            "write_assets_s": float(rebuild["write_assets_s"]),
+            "write_native_json_s": float(rebuild["write_native_json_s"]),
+        }
+        stage_timings["total_s"] = time.perf_counter() - total_start
+        generation_meta = write_generation_meta_for_c_backend(
+            source_path=source_path,
+            fast_mode=bool(fast_mode),
+            defer_static_figures=bool(defer_static_figures),
+            exported_dcms=exported_dcms,
+            stage_timings=stage_timings,
+            window_center=float(rebuild["window_center"]),
+            window_width=float(rebuild["window_width"]),
+            out_dir=target_out_dir,
+        )
+        return {
+            "source_path": source_path,
+            "output_dir": target_out_dir,
+            "native_json": rebuild["native_json"],
+            "exported_dcm_paths": exported_dcms,
+            "fast_mode": bool(fast_mode),
+            "defer_static_figures": bool(defer_static_figures),
+            "report_interaction_version": int(REPORT_INTERACTION_VERSION),
+            "report_content_version": int(REPORT_CONTENT_VERSION),
+            "kedge_model_version": int(KEDGE_MODEL_VERSION),
+            "window_center": float(rebuild["window_center"]),
+            "window_width": float(rebuild["window_width"]),
+            "stage_timings": stage_timings,
+            "generation_meta": generation_meta,
+            "backend_name": backend_name,
+            "backend_fallback_used": False,
+            "backend_requested": "c",
+        }
+    finally:
+        if temp_root.exists():
+            shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def render_report_figure_block(image_b64, alt, placeholder_text):
@@ -557,6 +1094,264 @@ def render_report_figure_block(image_b64, alt, placeholder_text):
         f'<div class="note">批处理已延后静态绘图。{placeholder_text}</div>'
         "</div>"
     )
+
+
+def build_single_slice_native_report_payload(
+    source_path,
+    backend_name,
+    recon_mode,
+    overview_img,
+    material_gallery_img,
+    difference_img,
+    weights_img,
+    band_img,
+    scatter_img,
+    water_dcm_path,
+    iodine_dcm_path,
+    calcium_dcm_path,
+    gadolinium_dcm_path,
+    kedge_dcm_path,
+    gadolinium_kedge_dcm_path,
+    material_metrics,
+    iodine_metrics,
+    kedge_metrics,
+    gadolinium_kedge_metrics,
+    material_weights,
+    iodine_weights,
+    kedge_weights,
+    gadolinium_kedge_weights,
+    material_interactive,
+):
+    material_weight_texts = {
+        name: ", ".join(f"{v:+.3f}" for v in material_weights[name]) for name in MATERIALS
+    }
+    iodine_weight_text = ", ".join(f"{v:+.3f}" for v in iodine_weights)
+    kedge_weight_text = ", ".join(f"{v:+.3f}" for v in kedge_weights)
+    gadolinium_kedge_weight_text = ", ".join(f"{v:+.3f}" for v in gadolinium_kedge_weights)
+    mode_label = "频谱先验版" if recon_mode == "spectral_prior" else "直接 2D 投影版"
+    coarse_desc = (
+        "先把 direct_low 压成平滑的行/列/全局谱形先验，再交给 G3-G2 承载全分辨率结构"
+        if recon_mode == "spectral_prior"
+        else "直接对 8-bin 二维图做线性投影，再与 G3-G2 做结构融合"
+    )
+    sections = [
+        {
+            "type": "file_table",
+            "title": "1. 输出文件",
+            "columns": ["文件", "路径", "说明"],
+            "rows": [
+                ["原始 PixelData 参考", str(source_path), "用于并排和叠加对比"],
+                ["水权重图 DICOM", str(water_dcm_path), "结构保真版本：G3-G2 底图 + 水材料频谱调制"],
+                ["碘权重图 DICOM", str(iodine_dcm_path), "结构保真版本：G3-G2 底图 + 碘频谱调制"],
+                ["钙权重图 DICOM", str(calcium_dcm_path), "结构保真版本：G3-G2 底图 + 钙材料频谱调制"],
+                ["钆权重图 DICOM", str(gadolinium_dcm_path), "结构保真版本：G3-G2 底图 + 钆材料频谱调制"],
+                ["碘K-edge 权重图 DICOM", str(kedge_dcm_path), "结构保真版本：G3-G2 底图 + 33keV 附近跨边缘差分调制"],
+                ["钆K-edge 权重图 DICOM", str(gadolinium_kedge_dcm_path), "结构保真版本：G3-G2 底图 + 50keV 附近跨边缘差分调制"],
+            ],
+        },
+        {
+            "type": "callout",
+            "title": "2. 结论摘要",
+            "style": "ok",
+            "items": [
+                "当前项目中没有现成的逐像素碘图 DICOM，但已有完整的 8-bin、材料曲线和 PixelData 重建线索。",
+                "低分辨率频谱信息仍来自 <span class=\"mono\">G1-G0</span> 的 8 个 band，但最终 DICOM 不再直接使用插值后的 band 图。",
+                f"当前模式会{coarse_desc}，所以 8-bin 更像“频谱先验”而不是整图材料空间分布。",
+                "最终输出仍以“<span class=\"mono\">G3-G2</span> 结构底图 × 频谱调制因子”为主，因此空间结构更接近原始 DCM。",
+                "当前报告同时导出水 / 碘 / 钙 / 钆 / 碘K-edge / 钆K-edge 六类材料敏感权重图，其中两类 K-edge 都保留为差分型目标。",
+            ],
+        },
+        {
+            "type": "callout",
+            "title": "",
+            "style": "warn",
+            "items": [
+                "这里的权重图是“基于现有信息的重建尝试”，不是厂商协议确认后的定量浓度图。",
+                "低分辨率 8-bin 图本身仍然不是最终 DCM 结构，所以它们现在只参与调制，不直接作为导出图像。",
+                "Gap 区域仍然没有足够证据支持逐像素权重解释，因此本次没有把 Gap 直接用于图像重建。",
+            ],
+        },
+        {
+            "type": "figure",
+            "title": "3. 对比视图",
+            "image_b64": overview_img,
+            "placeholder": "如需完整总览图，可对当前层单独点击“分析生成报告”重新生成详细图版。",
+            "allow_static_figure_refresh": overview_img is None,
+            "caption": "",
+        },
+        {
+            "type": "interactive",
+            "title": "对比视图联动阈值截断",
+            "payload": material_interactive,
+            "note": (
+                "当前交互视图使用下采样预览图以提升滑动流畅度。你可以自由切换主视图元素和对比元素；"
+                "滑块以主视图的阈值范围为基准，对比元素会按相同归一化比例联动。"
+                "低于阈值的像素在权重图中转为灰阶，在叠加图中恢复为原始灰阶底图。"
+            ),
+        },
+        {
+            "type": "figure",
+            "title": "",
+            "image_b64": difference_img,
+            "placeholder": "当前仍保留交互对比区，可直接切换材料并联动阈值查看差异。",
+            "caption": "当前仍保留交互对比区，可直接切换材料并联动阈值查看差异。",
+        },
+        {
+            "type": "callout",
+            "title": "",
+            "style": "note",
+            "items": [
+                "差异图按 <code>碘权重 - 碘K-edge 权重</code> 计算：偏红表示碘权重更强，偏蓝表示碘K-edge 权重更强，接近白色表示两者接近。"
+            ],
+        },
+        {
+            "type": "figure",
+            "title": "4. 权重来源",
+            "image_b64": weights_img,
+            "placeholder": "批处理阶段已跳过材料曲线静态图，以优先完成整批切片计算。",
+            "caption": "",
+        },
+        {
+            "type": "callout",
+            "title": "",
+            "style": "note",
+            "items": [
+                f"能区边界采用现有报告里的 8-bin 假设：<span class=\"mono\">{', '.join(BIN_LABELS)}</span>。",
+                "水 / 碘 / 钙 / 钆四类材料权重都来自“目标材料曲线投影到其余材料 + 常数项的正交补空间”。",
+                "碘K-edge 权重来自对 <span class=\"mono\">28-33keV</span> 与 <span class=\"mono\">33-38keV</span> 跨边缘差分目标的正交投影；钆K-edge 权重来自对 <span class=\"mono\">38-48keV</span> 与 <span class=\"mono\">48-62keV</span> 跨边缘差分目标的正交投影。",
+                "这些权重现在优先用于提取平滑的频谱先验，再与完整结构底图融合；仅在 direct 模式下才把 2D band 投影直接当 coarse map。",
+            ],
+        },
+        {
+            "type": "figure",
+            "title": "5. 额外材料视图",
+            "image_b64": material_gallery_img,
+            "placeholder": "当前可先通过交互区查看水 / 钙 / 钆 / 双 K-edge 的叠加效果。",
+            "caption": "",
+        },
+        {
+            "type": "callout",
+            "title": "",
+            "style": "note",
+            "items": [
+                "额外材料页展示了 <code>水 / 钙 / 钆 / 钆K-edge</code> 四张权重图和各自叠加视图；碘图与碘K-edge 图仍保留在上方主对比页和差异页中。"
+            ],
+        },
+        {
+            "type": "figure",
+            "title": "6. 8-bin 重建基础",
+            "image_b64": band_img,
+            "placeholder": "如果需要完整 8-bin 解释图，可针对当前层单独重生详细报告。",
+            "caption": "",
+        },
+        {
+            "type": "metric_table",
+            "title": "7. 统计关系",
+            "columns": ["指标", "碘权重图", "碘K-edge 权重图", "钆K-edge 权重图"],
+            "rows": [
+                ["与 PixelData 的相关系数", f"{iodine_metrics['corr_pixel']:.3f}", f"{kedge_metrics['corr_pixel']:.3f}", f"{gadolinium_kedge_metrics['corr_pixel']:.3f}"],
+                ["Top 1% 热点与高 PixelData 区域重叠率", f"{iodine_metrics['top1_overlap_hi_pixel']:.3f}", f"{kedge_metrics['top1_overlap_hi_pixel']:.3f}", f"{gadolinium_kedge_metrics['top1_overlap_hi_pixel']:.3f}"],
+                ["高密度区均值", f"{iodine_metrics['high_mean']:.1f}", f"{kedge_metrics['high_mean']:.1f}", f"{gadolinium_kedge_metrics['high_mean']:.1f}"],
+                ["软组织区均值", f"{iodine_metrics['soft_mean']:.1f}", f"{kedge_metrics['soft_mean']:.1f}", f"{gadolinium_kedge_metrics['soft_mean']:.1f}"],
+                ["高密度区 - 软组织区对比", f"{iodine_metrics['contrast_hi_soft']:.1f}", f"{kedge_metrics['contrast_hi_soft']:.1f}", f"{gadolinium_kedge_metrics['contrast_hi_soft']:.1f}"],
+            ],
+        },
+        {
+            "type": "metric_table",
+            "title": "",
+            "columns": ["指标", "水权重图", "钙权重图", "钆权重图"],
+            "rows": [
+                ["与 PixelData 的相关系数", f"{material_metrics['Water']['corr_pixel']:.3f}", f"{material_metrics['Calcium']['corr_pixel']:.3f}", f"{material_metrics['Gadolinium']['corr_pixel']:.3f}"],
+                ["Top 1% 热点与高 PixelData 区域重叠率", f"{material_metrics['Water']['top1_overlap_hi_pixel']:.3f}", f"{material_metrics['Calcium']['top1_overlap_hi_pixel']:.3f}", f"{material_metrics['Gadolinium']['top1_overlap_hi_pixel']:.3f}"],
+                ["高密度区均值", f"{material_metrics['Water']['high_mean']:.1f}", f"{material_metrics['Calcium']['high_mean']:.1f}", f"{material_metrics['Gadolinium']['high_mean']:.1f}"],
+                ["软组织区均值", f"{material_metrics['Water']['soft_mean']:.1f}", f"{material_metrics['Calcium']['soft_mean']:.1f}", f"{material_metrics['Gadolinium']['soft_mean']:.1f}"],
+                ["高密度区 - 软组织区对比", f"{material_metrics['Water']['contrast_hi_soft']:.1f}", f"{material_metrics['Calcium']['contrast_hi_soft']:.1f}", f"{material_metrics['Gadolinium']['contrast_hi_soft']:.1f}"],
+            ],
+        },
+        {
+            "type": "figure",
+            "title": "",
+            "image_b64": scatter_img,
+            "placeholder": "批处理阶段已略过统计散点静态图，以减少整批图形渲染耗时。",
+            "caption": "",
+        },
+        {
+            "type": "callout",
+            "title": "8. 方法说明",
+            "style": "note",
+            "items": [
+                "输入数据：原始 DICOM 的 <span class=\"mono\">PixelData</span> 与私有标签 <span class=\"mono\">(EFE1,1001)</span>。",
+                "中间结果：先解码 4 组 JPEG2000，再取 <span class=\"mono\">G1-G0</span> 形成 8 个 256x2048 的低分辨率能区图。",
+                "低分辨率调制图：<span class=\"mono\">direct_low = sum(w[b] * bin[b])</span>，再按当前模式生成 <span class=\"mono\">coarse_map</span>。",
+                "最终导出图：<span class=\"mono\">final_map = normalize(G3-G2) * (0.25 + 0.75 * normalize(coarse_map))</span>。",
+                "输出 DICOM：把权重图缩放到 int16 存成派生 Secondary Capture，以便后续查看和归档。",
+            ],
+        },
+        {
+            "type": "callout",
+            "title": "9. 材料权重向量",
+            "style": "note",
+            "items": [
+                f"水权重向量：<code>{material_weight_texts['Water']}</code>",
+                f"碘权重向量：<code>{iodine_weight_text}</code>",
+                f"钙权重向量：<code>{material_weight_texts['Calcium']}</code>",
+                f"钆权重向量：<code>{material_weight_texts['Gadolinium']}</code>",
+                f"碘K-edge 权重向量：<code>{kedge_weight_text}</code>",
+                f"钆K-edge 权重向量：<code>{gadolinium_kedge_weight_text}</code>",
+            ],
+        },
+        {
+            "type": "file_table",
+            "title": "10. 从数据块到逐像素伪彩权重的重建流程",
+            "columns": ["阶段", "输入", "输出", "空间尺寸", "说明"],
+            "rows": [
+                ["1. 解析数据块", "(EFE1,1001)", "4 组 JPEG2000 tile 流", "每组 64 slots", "通过搜索 jp2c marker 切分出嵌入式 JP2 codestream"],
+                ["2. 解码 tile", "G0/G1/G2/G3", "60 张 tile 图", "每 tile 256x256", "每组 64 个槽位中有 4 个空 tile，因此有效 tile 为 60 张"],
+                ["3. 重组 band", "G1-G0", "8 张 Bin 图", "每 Bin 256x2048", "每个 tile 被切成 8 条 32x256 的 band，按 band 索引跨 tile 拼接"],
+                ["4. 频谱投影", "8-bin + 权重向量", "direct_low", "256x2048", "先按 bin 权重做线性组合，得到直接投影图"],
+                ["5. 频谱先验", "direct_low + PixelData + G3-G2", "coarse map", "256x2048", "默认频谱先验版会把 direct_low 压成更平滑的行/列/全局谱形先验，避免把 tile 拼图直接当全图材料分布"],
+                ["6. 结构融合", "G3-G2 + coarse map", "最终权重图", "2048x2048", "用完整结构底图承载空间结构，再用 coarse map 做频谱调制"],
+                ["7. 伪彩显示", "最终权重图", "Qt 原生叠加图", "2048x2048", "DICOM 中实际存灰度权重，UI 中再映射成伪彩"],
+            ],
+        },
+        {
+            "type": "ordered_list",
+            "title": "11. 详细流程拆解",
+            "items": [
+                "从私有数据块 <code>(EFE1,1001)</code> 中搜索 <code>jp2c</code> marker，把每个 marker 后面的内容当作独立 JPEG2000 codestream 切出并解码。",
+                "按组解码为 <code>G0 / G1 / G2 / G3</code> 四组 tile；其中索引 <code>{0, 7, 56, 63}</code> 为空 tile，其余有效 tile 为 60 张。",
+                "构造两个基础域：<code>G1-G0</code> 提供低分辨率频谱信息，<code>G3-G2</code> 提供与原始 DCM 更一致的结构底图。",
+                "把每张 256x256 tile 按行切成 8 个 32x256 band，并跨 tile 拼成 8 张 <code>256x2048</code> 的 Bin 图。",
+                "对每个 low-res 坐标 <code>(r,c)</code>，取 8 个 Bin 值组成 8 维向量，再与水 / 碘 / 钙 / 钆 / 碘K-edge / 钆K-edge 权重向量做点积，得到 coarse map。",
+                "材料权重来自材料曲线对其余材料与常数项的正交投影；K-edge 权重来自跨边缘相邻 bin 差分目标的正交投影。",
+                "由于 low-res 结果只有 <code>256x2048</code>，直接放大会出现条带和伪结构，因此当前不会把它直接当最终权重图。",
+                "当前采用“结构保真融合”：先把 coarse map 上采样到 full-res，再与 <code>G3-G2</code> 结构底图在 body mask 内归一化后做逐像素调制融合。",
+                "最终导出的 DICOM 保持灰度权重，PyQt 原生报告中再用色表映射与灰度底图叠加，得到可交互的伪彩图。",
+            ],
+        },
+        {
+            "type": "callout",
+            "title": "12. 需要明确的假设与限制",
+            "style": "warn",
+            "items": [
+                "<b>已有证据支持</b>：<code>(EFE1,1001)</code> 内确实嵌入了可解码的 JPEG2000 数据流；<code>G1-G0</code> 可以按 8-band 重组成能区图；<code>G3-G2</code> 可以提供与原始 DCM 更一致的结构底图。",
+                "<b>重建假设</b>：8 个 band 对应 8 个能区、材料曲线平均可作为能区权重设计依据、以及 <code>G3-G2 × coarse modulation</code> 是合理的结构保真融合方式。",
+                "<b>尚未证实</b>：这些步骤不等价于厂商私有协议中的原始物质分解公式，也不能保证对应真实碘浓度或真实 K-edge 定量值。",
+                "<b>结论</b>：本报告中的伪彩权重图适合做结构一致的材料敏感可视化和对比分析，不应直接当作临床定量图使用。",
+            ],
+        },
+    ]
+    return {
+        "type": "iodine_kedge_report_native",
+        "schema_version": int(REPORT_CONTENT_VERSION),
+        "title": "碘能量分解权重图 / 双 K-edge 权重图重建报告",
+        "subtitle": "基于当前选中的单张 DICOM 切片生成。",
+        "meta_lines": [
+            {"label": "当前计算后端", "value": backend_name, "accent": "#58a6ff"},
+            {"label": "当前重建模式", "value": mode_label, "accent": "#f0883e"},
+        ],
+        "sections": sections,
+    }
 
 
 def representative_cache_path():
@@ -871,20 +1666,26 @@ def smooth_1d_signal(x, window):
         window = min(window if window % 2 == 1 else window + 1, size if size % 2 == 1 else max(size - 1, 1))
         if window <= 1:
             return x.clone()
-        kernel = torch.ones((1, 1, window), dtype=torch.float64, device=x.device) / float(window)
-        pad = window // 2
-        x_pad = torch_f.pad(x.view(1, 1, -1), (pad, pad), mode="replicate")
-        return torch_f.conv1d(x_pad, kernel)[0, 0]
+        radius = window // 2
+        out = torch.empty_like(x, dtype=torch.float64)
+        for i in range(size):
+            begin = max(0, i - radius)
+            end = min(size - 1, i + radius)
+            out[i] = torch.mean(x[begin : end + 1])
+        return out
     x = np.asarray(x, dtype=np.float64)
     if x.size == 0 or window <= 1:
         return x.copy()
     window = min(window if window % 2 == 1 else window + 1, x.size if x.size % 2 == 1 else max(x.size - 1, 1))
     if window <= 1:
         return x.copy()
-    kernel = np.ones(window, dtype=np.float64) / float(window)
-    pad = window // 2
-    x_pad = np.pad(x, (pad, pad), mode="edge")
-    return np.convolve(x_pad, kernel, mode="valid")
+    radius = window // 2
+    out = np.empty_like(x, dtype=np.float64)
+    for i in range(x.size):
+        begin = max(0, i - radius)
+        end = min(x.size - 1, i + radius)
+        out[i] = np.mean(x[begin : end + 1], dtype=np.float64)
+    return out
 
 
 def robust_normalize_1d(x, lo=1, hi=99):
@@ -921,8 +1722,7 @@ def masked_profile_median(img, mask, axis):
         masked = torch.where(mask_t, img, torch.nan)
         valid_count = mask_t.sum(dim=axis)
         out = torch.nanmedian(masked, dim=axis).values
-        fallback = torch.nanmedian(img, dim=axis).values
-        out = torch.where(valid_count > 0, out, fallback)
+        out = torch.where(valid_count > 0, out, torch.zeros_like(out, dtype=torch.float64))
         return torch.nan_to_num(out, nan=0.0)
     img = np.asarray(img, dtype=np.float64)
     if mask is None:
@@ -940,8 +1740,7 @@ def masked_profile_median(img, mask, axis):
             [np.median(masked[idx][np.isfinite(masked[idx])]) if valid_count[idx] else np.nan for idx in range(masked.shape[0])],
             dtype=np.float64,
         )
-    fallback = np.nanmedian(img, axis=axis)
-    out = np.where(np.isfinite(out), out, fallback)
+    out = np.where(np.isfinite(out), out, 0.0)
     return np.nan_to_num(out, nan=0.0)
 
 
@@ -1006,8 +1805,7 @@ def build_pixel_energy_surrogate_stack(ds, pixel_data, curves, lowres_body):
     density_low = normalize_in_mask(pixel_low, body)
     enhancement_low = normalize_in_mask(np.clip(pixel_low - p75, 0.0, None), body)
     hot_low = normalize_in_mask(np.clip(pixel_low - p92, 0.0, None), body)
-    gy, gx = np.gradient(pixel_low)
-    edge_low = normalize_in_mask(np.hypot(gx, gy), body)
+    edge_low = normalize_in_mask(gradient_magnitude_lowres_exact(pixel_low), body)
 
     bin_curve_matrix = compute_bin_curve_matrix(curves)
     water_profile = zscore(bin_curve_matrix[:, 0])
@@ -1257,13 +2055,14 @@ def read_pixel_array(ds):
     return arr * slope + intercept
 
 
-def ordered_dicom_files(data_dir):
+def collect_dicom_inventory(data_dir):
     data_dir = Path(data_dir)
     if data_dir.is_file():
         search_paths = [data_dir]
     else:
         search_paths = sorted(path for path in data_dir.rglob("*") if path.is_file())
 
+    dicom_total_count = 0
     series_groups = {}
     fallback_counter = 0
     for path in search_paths:
@@ -1271,6 +2070,7 @@ def ordered_dicom_files(data_dir):
             ds = pydicom.dcmread(str(path), force=True)
         except Exception:
             continue
+        dicom_total_count += 1
         if (0x7FE0, 0x0010) not in ds or (0xEFE1, 0x1001) not in ds:
             continue
 
@@ -1287,6 +2087,17 @@ def ordered_dicom_files(data_dir):
 
         series_groups.setdefault(series_uid, []).append((order_key, path))
 
+    return {
+        "data_dir": data_dir,
+        "dicom_total_count": dicom_total_count,
+        "series_groups": series_groups,
+    }
+
+
+def ordered_dicom_files(data_dir):
+    inventory = data_dir if isinstance(data_dir, dict) else collect_dicom_inventory(data_dir)
+    data_dir = inventory["data_dir"]
+    series_groups = inventory["series_groups"]
     if not series_groups:
         return []
 
@@ -1925,7 +2736,7 @@ def build_weight_vectors(bin_curve_matrix):
 
 
 def orient_map_positive(map_low, pixel_data):
-    up = backend_zoom(map_low, (8, 1), order=1)
+    up = upsample_rows_linear_exact(map_low, factor=8)
     body = pixel_data > percentile_scalar(pixel_data, 50)
     high = pixel_data > percentile_scalar(pixel_data, 99.5)
     if count_nonzero_scalar(high) < 100:
@@ -1953,7 +2764,7 @@ def fuse_structure_preserving_map(base_full, coarse_low, pixel_data, coarse_weig
     body = pixel_data > percentile_scalar(pixel_data, 50)
     base_full = orient_full_map_positive(base_full, pixel_data)
     coarse_up = orient_map_positive(coarse_low, pixel_data)
-    coarse_up = backend_zoom(coarse_up, (8, 1), order=1)
+    coarse_up = upsample_rows_linear_exact(coarse_up, factor=8)
     base_norm = normalize_in_mask(base_full, body)
     coarse_norm = normalize_in_mask(coarse_up, body)
     fused = base_norm * (1.0 - coarse_weight + coarse_weight * coarse_norm)
@@ -1961,12 +2772,18 @@ def fuse_structure_preserving_map(base_full, coarse_low, pixel_data, coarse_weig
     return fused, coarse_up
 
 
-def map_metrics(map_full, pixel_data):
-    body = pixel_data > np.percentile(pixel_data, 50)
-    high = pixel_data > np.percentile(pixel_data, 99.5)
-    if np.count_nonzero(high) < 100:
-        high = pixel_data > np.percentile(pixel_data, 98.5)
-    soft = body & (pixel_data > np.percentile(pixel_data, 65)) & (pixel_data < np.percentile(pixel_data, 80))
+def map_metrics(map_full, pixel_data, pixel_masks=None):
+    if pixel_masks is None:
+        p50, p65, p80, p98_5, p99_5 = np.percentile(pixel_data, [50, 65, 80, 98.5, 99.5])
+        body = pixel_data > p50
+        high = pixel_data > p99_5
+        if np.count_nonzero(high) < 100:
+            high = pixel_data > p98_5
+        soft = body & (pixel_data > p65) & (pixel_data < p80)
+        pixel_masks = (body, high, soft)
+    else:
+        body, high, soft = pixel_masks
+
     mask = body & np.isfinite(map_full)
     corr = np.corrcoef(map_full[mask].ravel(), pixel_data[mask].ravel())[0, 1] if np.count_nonzero(mask) > 100 else np.nan
     top = map_full >= np.percentile(map_full[mask], 99.0) if np.count_nonzero(mask) > 100 else np.zeros_like(mask)
@@ -2876,7 +3693,7 @@ DICOM 导出时保存的是单通道灰度权重值，不直接存 RGB 伪彩。
     return out_html
 
 
-def generate_single_slice_report(file_path, output_root=None, fast_mode=False, defer_static_figures=False):
+def generate_single_slice_report_python_impl(file_path, output_root=None, fast_mode=False, defer_static_figures=False):
     source_path = Path(file_path)
     if not source_path.exists():
         raise FileNotFoundError(f"切片不存在: {source_path}")
@@ -2887,8 +3704,6 @@ def generate_single_slice_report(file_path, output_root=None, fast_mode=False, d
     target_out_dir.mkdir(parents=True, exist_ok=True)
     CACHE_DIR.mkdir(exist_ok=True)
 
-    prev_out_dir = OUT_DIR
-    globals()["OUT_DIR"] = target_out_dir
     try:
         stage_timings = {}
         total_start = time.perf_counter()
@@ -2984,84 +3799,49 @@ def generate_single_slice_report(file_path, output_root=None, fast_mode=False, d
         gadolinium_dcm_path = str(exported_dcms["gadolinium"])
         kedge_dcm_path = str(exported_dcms["kedge"])
         gadolinium_kedge_dcm_path = str(exported_dcms["gadolinium_kedge"])
-
-        out_html = write_html(
-            pixel_path=str(source_path),
-            iodine_dcm_path=iodine_dcm_path,
-            kedge_dcm_path=kedge_dcm_path,
-            gadolinium_kedge_dcm_path=gadolinium_kedge_dcm_path,
-            backend_name=CUDA_BACKEND,
-            recon_mode=products.get("recon_mode", RECON_MODE),
-            overview_img=overview_img,
-            material_gallery_img=material_gallery_img,
-            difference_img=difference_img,
-            weights_img=weights_img,
-            band_img=band_img,
-            scatter_img=scatter_img,
-            water_dcm_path=water_dcm_path,
-            calcium_dcm_path=calcium_dcm_path,
-            gadolinium_dcm_path=gadolinium_dcm_path,
-            material_metrics=material_metrics,
-            iodine_metrics=iodine_metrics,
-            kedge_metrics=kedge_metrics,
-            gadolinium_kedge_metrics=gadolinium_kedge_metrics,
-            iodine_weights=products["iodine_weights"],
-            material_weights=products["material_weights"],
-            kedge_weights=products["kedge_weights"],
-            gadolinium_kedge_weights=products["gadolinium_kedge_weights"],
-            material_interactive=build_material_interactive_payload(
-                products["pixel_data"],
-                {
-                    "Water": products["water_full"],
-                    "Iodine": products["iodine_full"],
-                    "Calcium": products["calcium_full"],
-                    "Gadolinium": products["gadolinium_full"],
-                    "Iodine K-edge": products["kedge_full"],
-                    "Gadolinium K-edge": products["gadolinium_kedge_full"],
-                },
-                window_center=window_center,
-                window_width=window_width,
-            ),
+        material_interactive = build_material_interactive_payload(
+            products["pixel_data"],
+            {
+                "Water": products["water_full"],
+                "Iodine": products["iodine_full"],
+                "Calcium": products["calcium_full"],
+                "Gadolinium": products["gadolinium_full"],
+                "Iodine K-edge": products["kedge_full"],
+                "Gadolinium K-edge": products["gadolinium_kedge_full"],
+            },
+            window_center=window_center,
+            window_width=window_width,
         )
-        stage_timings["write_html_s"] = time.perf_counter() - stage_start
 
-        stage_start = time.perf_counter()
-        native_json = None
-        if not fast_mode and not defer_static_figures:
-            native_json = write_native_report(
-                {
-                    "type": "iodine_kedge_report",
-                    "title": "碘能量分解权重图 / 双 K-edge 权重图重建报告",
-                    "subtitle": "基于当前选中的单张 DICOM 切片生成。",
-                    "source_path": str(source_path),
-                    "files": [
-                        {"name": "原始 PixelData 切片", "path": str(source_path), "description": "当前选中 DICOM"},
-                        {"name": "水权重图 DICOM", "path": str(exported_dcms["water"]), "description": "单切片生成结果"},
-                        {"name": "碘权重图 DICOM", "path": str(exported_dcms["iodine"]), "description": "单切片生成结果"},
-                        {"name": "钙权重图 DICOM", "path": str(exported_dcms["calcium"]), "description": "单切片生成结果"},
-                        {"name": "钆权重图 DICOM", "path": str(exported_dcms["gadolinium"]), "description": "单切片生成结果"},
-                        {"name": "碘K-edge 权重图 DICOM", "path": str(exported_dcms["kedge"]), "description": "单切片生成结果"},
-                        {"name": "钆K-edge 权重图 DICOM", "path": str(exported_dcms["gadolinium_kedge"]), "description": "单切片生成结果"},
-                    ],
-                    "figures": [
-                        {"title": "对比视图", "path": str(overview_png), "description": "PixelData、结构底图及叠加视图"},
-                        {"title": "额外材料权重图", "path": str(materials_png), "description": "水 / 钙 / 钆 / 钆K-edge 权重图及叠加视图"},
-                        {"title": "差异图", "path": str(difference_png), "description": "碘权重减去碘K-edge 权重的差异"},
-                        {"title": "权重来源", "path": str(weights_png), "description": "材料曲线与权重向量"},
-                        {"title": "8-bin 重建基础", "path": str(bands_png), "description": "各能区 band 与贡献"},
-                        {"title": "统计关系", "path": str(scatter_png), "description": "派生权重与 PixelData 的关系"},
-                    ],
-                    "metrics": {key.lower(): value for key, value in material_metrics.items()},
-                    "weight_vectors": {
-                        "water": [float(v) for v in products["water_weights"]],
-                        "iodine": [float(v) for v in products["iodine_weights"]],
-                        "calcium": [float(v) for v in products["calcium_weights"]],
-                        "gadolinium": [float(v) for v in products["gadolinium_weights"]],
-                        "kedge": [float(v) for v in products["kedge_weights"]],
-                        "gadolinium_kedge": [float(v) for v in products["gadolinium_kedge_weights"]],
-                    },
-                }
-            )
+        native_json = write_native_report(
+            build_single_slice_native_report_payload(
+                source_path=source_path,
+                backend_name=CUDA_BACKEND,
+                recon_mode=products.get("recon_mode", RECON_MODE),
+                overview_img=overview_img,
+                material_gallery_img=material_gallery_img,
+                difference_img=difference_img,
+                weights_img=weights_img,
+                band_img=band_img,
+                scatter_img=scatter_img,
+                water_dcm_path=water_dcm_path,
+                iodine_dcm_path=iodine_dcm_path,
+                calcium_dcm_path=calcium_dcm_path,
+                gadolinium_dcm_path=gadolinium_dcm_path,
+                kedge_dcm_path=kedge_dcm_path,
+                gadolinium_kedge_dcm_path=gadolinium_kedge_dcm_path,
+                material_metrics=material_metrics,
+                iodine_metrics=iodine_metrics,
+                kedge_metrics=kedge_metrics,
+                gadolinium_kedge_metrics=gadolinium_kedge_metrics,
+                material_weights=products["material_weights"],
+                iodine_weights=products["iodine_weights"],
+                kedge_weights=products["kedge_weights"],
+                gadolinium_kedge_weights=products["gadolinium_kedge_weights"],
+                material_interactive=material_interactive,
+            ),
+            out_dir=target_out_dir,
+        )
         stage_timings["write_native_json_s"] = time.perf_counter() - stage_start
 
         stage_timings["total_s"] = time.perf_counter() - total_start
@@ -3079,12 +3859,12 @@ def generate_single_slice_report(file_path, output_root=None, fast_mode=False, d
                 "window_width": float(window_width),
                 "dcm_exports_ready": all(path is not None and Path(path).exists() for path in exported_dcms.values()),
                 "stage_timings": {key: float(value) for key, value in stage_timings.items()},
-            }
+            },
+            out_dir=target_out_dir,
         )
         return {
             "source_path": source_path,
             "output_dir": target_out_dir,
-            "html_path": out_html,
             "native_json": native_json,
             "exported_dcm_paths": exported_dcms,
             "fast_mode": bool(fast_mode),
@@ -3096,9 +3876,75 @@ def generate_single_slice_report(file_path, output_root=None, fast_mode=False, d
             "window_width": float(window_width),
             "stage_timings": stage_timings,
             "generation_meta": generation_meta,
+            "backend_name": CUDA_BACKEND,
+            "backend_fallback_used": False,
+            "backend_requested": "python",
         }
-    finally:
-        globals()["OUT_DIR"] = prev_out_dir
+    except Exception:
+        raise
+
+
+def generate_single_slice_report_with_backend(
+    file_path,
+    output_root=None,
+    fast_mode=False,
+    defer_static_figures=False,
+    backend_preference="auto",
+):
+    backend_preference = str(backend_preference or "auto").strip().lower()
+    if backend_preference not in {"auto", "python", "c"}:
+        backend_preference = "auto"
+
+    if backend_preference == "python":
+        return generate_single_slice_report_python_impl(
+            file_path,
+            output_root=output_root,
+            fast_mode=fast_mode,
+            defer_static_figures=defer_static_figures,
+        )
+
+    if backend_preference == "c":
+        return run_c_backend_single_slice(
+            file_path,
+            output_root=output_root,
+            fast_mode=fast_mode,
+            defer_static_figures=defer_static_figures,
+        )
+
+    try:
+        return run_c_backend_single_slice(
+            file_path,
+            output_root=output_root,
+            fast_mode=fast_mode,
+            defer_static_figures=defer_static_figures,
+        )
+    except Exception as exc:
+        fallback = generate_single_slice_report_python_impl(
+            file_path,
+            output_root=output_root,
+            fast_mode=fast_mode,
+            defer_static_figures=defer_static_figures,
+        )
+        fallback["backend_fallback_used"] = True
+        fallback["backend_requested"] = "auto"
+        fallback["c_backend_error"] = str(exc)
+        return fallback
+
+
+def generate_single_slice_report(
+    file_path,
+    output_root=None,
+    fast_mode=False,
+    defer_static_figures=False,
+    backend_preference="auto",
+):
+    return generate_single_slice_report_with_backend(
+        file_path,
+        output_root=output_root,
+        fast_mode=fast_mode,
+        defer_static_figures=defer_static_figures,
+        backend_preference=backend_preference,
+    )
 
 
 def generate_volume_report(data_dir=None, output_root=None):
@@ -3294,41 +4140,16 @@ def generate_volume_report(data_dir=None, output_root=None):
         b64_to_png_file(scatter_img, scatter_png)
         b64_to_png_file(volume_img, volume_png)
 
-        out_html = write_html(
-            pixel_path=str(files[rep_idx]),
-            iodine_dcm_path=str(representative_dcms["iodine"]),
-            kedge_dcm_path=str(representative_dcms["kedge"]),
-            gadolinium_kedge_dcm_path=str(representative_dcms["gadolinium_kedge"]),
-            backend_name=CUDA_BACKEND,
-            recon_mode=rep_products.get("recon_mode", RECON_MODE),
-            overview_img=overview_img,
-            material_gallery_img=material_gallery_img,
-            difference_img=difference_img,
-            weights_img=weights_img,
-            band_img=band_img,
-            scatter_img=scatter_img,
-            water_dcm_path=str(representative_dcms["water"]),
-            calcium_dcm_path=str(representative_dcms["calcium"]),
-            gadolinium_dcm_path=str(representative_dcms["gadolinium"]),
-            material_metrics=material_metrics,
-            iodine_metrics=iodine_metrics,
-            kedge_metrics=kedge_metrics,
-            gadolinium_kedge_metrics=gadolinium_kedge_metrics,
-            iodine_weights=rep_products["iodine_weights"],
-            material_weights=rep_products["material_weights"],
-            kedge_weights=rep_products["kedge_weights"],
-            gadolinium_kedge_weights=rep_products["gadolinium_kedge_weights"],
-            material_interactive=build_material_interactive_payload(
-                rep_products["pixel_data"],
-                {
-                    "Water": rep_products["water_full"],
-                    "Iodine": rep_products["iodine_full"],
-                    "Calcium": rep_products["calcium_full"],
-                    "Gadolinium": rep_products["gadolinium_full"],
-                    "Iodine K-edge": rep_products["kedge_full"],
-                    "Gadolinium K-edge": rep_products["gadolinium_kedge_full"],
-                },
-            ),
+        material_interactive = build_material_interactive_payload(
+            rep_products["pixel_data"],
+            {
+                "Water": rep_products["water_full"],
+                "Iodine": rep_products["iodine_full"],
+                "Calcium": rep_products["calcium_full"],
+                "Gadolinium": rep_products["gadolinium_full"],
+                "Iodine K-edge": rep_products["kedge_full"],
+                "Gadolinium K-edge": rep_products["gadolinium_kedge_full"],
+            },
         )
         native_json = write_native_report(
             {
@@ -3431,6 +4252,7 @@ def generate_volume_report(data_dir=None, output_root=None):
                     "重建假设：8 个 band 对应 8 个能区、材料曲线平均可作为能区权重设计依据、以及 G3-G2 乘 coarse modulation 是合理的结构保真融合方式。",
                     "尚未证实：这些步骤不等价于厂商私有协议中的原始物质分解公式，也不能保证对应真实碘浓度或真实 K-edge 定量值。",
                 ],
+                "interactive_payload": material_interactive,
             }
         )
 
@@ -3438,11 +4260,9 @@ def generate_volume_report(data_dir=None, output_root=None):
             print(f"Saved DICOM: {representative_dcms[spec['key']]}")
             print(f"Saved DICOM series: {series_dirs[spec['key']]}")
         print(f"Saved Volume NPZ: {volume_npz}")
-        print(f"Saved HTML: {out_html}")
         print(f"Saved Native JSON: {native_json}")
         return {
             "output_dir": OUT_DIR,
-            "html_path": out_html,
             "native_json": native_json,
             "volume_npz": volume_npz,
             "volume_manifest": volume_manifest_path,
